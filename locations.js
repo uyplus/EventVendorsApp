@@ -1,63 +1,37 @@
-// Transactional email. Uses Resend when configured; otherwise logs to the console
-// so flows are testable in dev without a provider.
+// Serves location data (country → state/province → city).
 //
-// SETUP:
-//   1) npm install resend
-//   2) Create a Resend account, verify your sending domain, get an API key.
-//   3) Set env:  RESEND_API_KEY=...   EMAIL_FROM="Event Vendors <no-reply@yourdomain.com>"
+// Source of truth, in priority order:
+//   1. data/geo.json  — the full worldwide dataset (run `npm run build-geo`)
+//   2. GEO_SEED       — the bundled ~20-country seed (works out of the box)
 //
-// All functions are no-throw: email failure never breaks the request that triggered it.
+// Shape (both): { "Country": { "State/Province": ["City", ...] } }
 
-let resend = null;
-async function client() {
-  if (resend) return resend;
-  if (!process.env.RESEND_API_KEY) return null;
-  const { Resend } = await import("resend");
-  resend = new Resend(process.env.RESEND_API_KEY);
-  return resend;
-}
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { GEO_SEED } from "./geoSeed.js";
 
-const FROM = () => process.env.EMAIL_FROM || "Event Vendors <onboarding@resend.dev>";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const GEO_PATH = path.join(__dirname, "..", "data", "geo.json");
 
-async function send({ to, subject, html }) {
-  try {
-    const c = await client();
-    if (!c) { console.log(`[email:dev] To:${to} | ${subject}\n${html}\n`); return { ok: true, dev: true }; }
-    await c.emails.send({ from: FROM(), to, subject, html });
-    return { ok: true };
-  } catch (e) {
-    console.error("[email] send failed:", e.message);
-    return { ok: false };
+let GEO = GEO_SEED;
+let SOURCE = "seed";
+try {
+  if (fs.existsSync(GEO_PATH)) {
+    GEO = JSON.parse(fs.readFileSync(GEO_PATH, "utf8"));
+    SOURCE = "geo.json";
   }
+} catch (e) {
+  console.warn("Could not read data/geo.json, using bundled seed:", e.message);
 }
+console.log(`Location data: ${Object.keys(GEO).length} countries (source: ${SOURCE})`);
 
-const shell = (title, body) => `
-  <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1E1A2B">
-    <h2 style="color:#3B2C4F">${title}</h2>
-    ${body}
-    <p style="font-size:12px;color:#8a8594;margin-top:28px">Event Vendors — your vision, our expertise.</p>
-  </div>`;
-
-export function sendVerifyEmail(to, link) {
-  return send({
-    to, subject: "Verify your Event Vendors account",
-    html: shell("Confirm your email", `
-      <p>Welcome! Please confirm your email to activate your account.</p>
-      <p><a href="${link}" style="background:#E26D4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Verify email</a></p>
-      <p style="font-size:12px;color:#8a8594">Or paste this link: ${link}</p>`),
-  });
-}
-
-export function sendResetEmail(to, link) {
-  return send({
-    to, subject: "Reset your Event Vendors password",
-    html: shell("Password reset", `
-      <p>We received a request to reset your password. This link expires in 30 minutes.</p>
-      <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Reset password</a></p>
-      <p style="font-size:12px;color:#8a8594">If you didn't request this, you can ignore this email.</p>`),
-  });
-}
-
-export function sendNotificationEmail(to, text) {
-  return send({ to, subject: "New activity on Event Vendors", html: shell("You have a new notification", `<p>${text}</p>`) });
-}
+export const source = () => SOURCE;
+export const countries = () => Object.keys(GEO).sort();
+export const statesOf = (country) => Object.keys(GEO[country] || {}).sort();
+export const citiesOf = (country, state) => {
+  const c = GEO[country];
+  if (!c) return [];
+  if (state) return (c[state] || []).slice().sort();
+  return Array.from(new Set([].concat(...Object.values(c)))).sort();
+};
