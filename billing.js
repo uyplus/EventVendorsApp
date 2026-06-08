@@ -1,36 +1,71 @@
-// Builds data/geo.json — the full worldwide country → state → city dataset —
-// from the open-source "countries-states-cities" database (dr5hn, ODbL).
+// Billing — vendor subscriptions (Sponsored) + customer service payments.
 //
-// Usage:  node scripts/build-geo.mjs            (needs internet, Node 18+)
+// This ships in DEMO MODE: with no STRIPE_SECRET_KEY set, the endpoints return
+// simulated sessions so the app flows end-to-end. To accept real money, set the
+// env vars below and uncomment the Stripe blocks (the shapes already match Stripe).
 //
-// Alternative sources you can adapt this to:
-//   • GeoNames (https://download.geonames.org/export/dump/) — admin1/admin2 + cities
-//   • Any provider that gives country/state/city; just emit the nested shape below.
+//   STRIPE_SECRET_KEY=sk_live_...          (use sk_test_... in the sandbox first)
+//   STRIPE_WEBHOOK_SECRET=whsec_...
+//   STRIPE_PRICE_SPONSORED=price_...       (the $29/mo recurring Price ID)
+//   APP_URL=https://yourapp.com            (for success/cancel redirects)
+//
+//   npm install stripe
+//   import Stripe from "stripe";
+//   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+//
+// IMPORTANT: never trust the client to grant "sponsored". The ONLY place a vendor
+// becomes sponsored is the webhook below, after Stripe confirms payment.
 
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+const LIVE = !!process.env.STRIPE_SECRET_KEY;
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(__dirname, "..", "data", "geo.json");
-const SRC = "https://raw.githubusercontent.com/dr5hn/countries-states-cities-database/master/json/countries%2Bstates%2Bcities.json";
+export const billingMode = () => (LIVE ? "live" : "demo");
 
-console.log("Downloading countries-states-cities dataset… (~30 MB)");
-const res = await fetch(SRC);
-if (!res.ok) { console.error("Download failed:", res.status, res.statusText); process.exit(1); }
-const data = await res.json();
-
-const geo = {};
-for (const c of data) {
-  const country = {};
-  for (const st of c.states || []) {
-    country[st.name] = (st.cities || []).map((ci) => ci.name);
+// Vendor → start a Sponsored subscription. Returns a Checkout URL to redirect to.
+export async function createSubscriptionCheckout({ user }) {
+  if (!LIVE) {
+    return { mode: "demo", url: `${process.env.APP_URL || ""}/billing/demo-success?plan=sponsored`, note: "Demo session — no real charge. Set STRIPE_SECRET_KEY to go live." };
   }
-  geo[c.name] = country;
+  // const session = await stripe.checkout.sessions.create({
+  //   mode: "subscription",
+  //   line_items: [{ price: process.env.STRIPE_PRICE_SPONSORED, quantity: 1 }],
+  //   client_reference_id: String(user.id),
+  //   customer_email: user.email,
+  //   success_url: `${process.env.APP_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+  //   cancel_url: `${process.env.APP_URL}/billing/cancel`,
+  // });
+  // return { mode: "live", url: session.url };
+  throw new Error("Stripe not wired yet — uncomment the block in billing.js");
 }
 
-fs.mkdirSync(path.dirname(OUT), { recursive: true });
-fs.writeFileSync(OUT, JSON.stringify(geo));
-const totalCities = Object.values(geo).reduce((n, st) => n + Object.values(st).reduce((m, cs) => m + cs.length, 0), 0);
-console.log(`Wrote ${OUT}: ${Object.keys(geo).length} countries, ${totalCities.toLocaleString()} cities.`);
-console.log("Restart the server to serve the full dataset.");
+// Customer → pay a deposit / for a service. Returns a Checkout URL (one-time payment).
+export async function createPaymentCheckout({ amount, currency = "usd", vendorId, description }) {
+  if (!LIVE) {
+    return { mode: "demo", url: `${process.env.APP_URL || ""}/pay/demo-success`, amount, note: "Demo session — no real charge." };
+  }
+  // const session = await stripe.checkout.sessions.create({
+  //   mode: "payment",
+  //   line_items: [{ price_data: { currency, unit_amount: Math.round(amount * 100), product_data: { name: description || `Booking deposit (vendor ${vendorId})` } }, quantity: 1 }],
+  //   success_url: `${process.env.APP_URL}/pay/success`,
+  //   cancel_url: `${process.env.APP_URL}/pay/cancel`,
+  // });
+  // return { mode: "live", url: session.url };
+  throw new Error("Stripe not wired yet — uncomment the block in billing.js");
+}
+
+// Stripe webhook → the source of truth that flips a vendor to/from Sponsored.
+// Mount with express.raw({ type: "application/json" }) so the signature verifies.
+export async function handleWebhook({ rawBody, signature, onSubscriptionActive, onSubscriptionCanceled }) {
+  if (!LIVE) return { received: true, mode: "demo" };
+  // const event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
+  // switch (event.type) {
+  //   case "checkout.session.completed":
+  //   case "customer.subscription.updated":
+  //     await onSubscriptionActive(event.data.object.client_reference_id);
+  //     break;
+  //   case "customer.subscription.deleted":
+  //     await onSubscriptionCanceled(event.data.object.client_reference_id);
+  //     break;
+  // }
+  // return { received: true };
+  throw new Error("Stripe not wired yet — uncomment the block in billing.js");
+}
