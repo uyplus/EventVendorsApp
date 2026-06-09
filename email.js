@@ -58,6 +58,38 @@ export function sendResetEmail(to, link) {
   });
 }
 
+// Contact form → routed to the team inbox. `replyTo` lets us reply straight to the sender.
+export function sendContactEmail({ name, email, subject, body }) {
+  const to = process.env.CONTACT_TO || "eventvendors.ca@gmail.com";
+  return send({
+    to, subject: `[Contact] ${subject || "(no subject)"}`,
+    html: shell("New contact message", `
+      <p><b>From:</b> ${name || "(not given)"} &lt;${email || "no email"}&gt;</p>
+      <p><b>Subject:</b> ${subject || "(none)"}</p>
+      <hr style="border:none;border-top:1px solid #eee;margin:14px 0" />
+      <p style="white-space:pre-wrap">${(body || "").replace(/</g, "&lt;")}</p>`),
+  });
+}
+
+// Warm welcome when a vendor upgrades to Sponsored.
+export function sendSubscriptionThankYou(to, name) {
+  return send({
+    to, subject: "🎉 Welcome to Sponsored — thank you!",
+    html: shell(`Thank you${name ? ", " + name : ""}!`, `
+      <p>Your Event Vendors listing is now <b>Sponsored</b> — thank you for backing your business with us.</p>
+      <p>Here's what's now switched on:</p>
+      <ul style="color:#1E1A2B;line-height:1.7">
+        <li>Priority placement at the top of search</li>
+        <li>The gold <b>Sponsored</b> badge on your listing</li>
+        <li>A feature slot on the home page</li>
+        <li>Up to 20 photos &amp; unlimited services across all categories</li>
+        <li>A bookable availability calendar and performance analytics</li>
+      </ul>
+      <p>We're rooting for you — here's to more bookings and unforgettable events.</p>
+      <p style="font-size:12px;color:#8a8594">Manage your subscription any time from your vendor dashboard.</p>`),
+  });
+}
+
 export function sendNotificationEmail(to, text) {
   return send({ to, subject: "New activity on Event Vendors", html: shell("You have a new notification", `<p>${text}</p>`) });
 }

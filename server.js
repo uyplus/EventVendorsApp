@@ -7,6 +7,9 @@ import { hashPassword, checkPassword, signToken, publicUser, requireAuth, requir
 import { countries, statesOf, citiesOf, source as geoSource } from "./locations.js";
 import { billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } from "./billing.js";
 import { mountFeatures } from "./features.js";
+import { sendVerifyEmail, sendContactEmail } from "./email.js";
+
+const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -102,14 +105,26 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       cuisines: b.cuisines && b.cuisines.length ? b.cuisines : null, services, hue: 200,
     });
   }
-  // In production: email a link like `${APP_URL}/verify?token=${emailToken}` instead of returning the token.
-  res.status(201).json({ token: signToken(user), user: publicUser(user), verifyToken: emailToken });
+  // Send a registration confirmation / verification email with an activation link.
+  // No-throw: a mail failure never blocks signup.
+  const verifyLink = `${APP_URL}/?verify=${emailToken}`;
+  sendVerifyEmail(email, verifyLink).catch(() => {});
+  res.status(201).json({ token: signToken(user), user: publicUser(user) });
 }));
 
 app.get("/api/auth/verify", h(async (req, res) => {
   const ok = await repo.verifyEmail(req.query.token);
   if (!ok) return res.status(400).json({ error: "Invalid or expired verification link." });
   res.json({ ok: true, verified: true });
+}));
+
+// Contact form (public, rate-limited) → emails the team inbox.
+app.post("/api/contact", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(async (req, res) => {
+  const b = req.body || {};
+  if (b.hp) return res.json({ ok: true });
+  if (!b.subject || !b.body) return res.status(400).json({ error: "Subject and message are required." });
+  sendContactEmail({ name: b.name, email: b.email, subject: b.subject, body: b.body }).catch(() => {});
+  res.json({ ok: true });
 }));
 
 app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }), h(async (req, res) => {

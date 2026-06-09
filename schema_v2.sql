@@ -1,97 +1,93 @@
-// Real payments with Stripe Checkout. Mounted only when STRIPE_SECRET_KEY is set,
-// so the app still runs (in demo-payment mode) without it.
-//
-// SETUP:
-//   1) npm install stripe
-//   2) In Stripe: create a recurring Price for the Sponsored plan ($29/mo) -> STRIPE_PRICE_SPONSORED
-//   3) Set env:
-//        STRIPE_SECRET_KEY=sk_live_or_test_...
-//        STRIPE_PRICE_SPONSORED=price_...
-//        STRIPE_WEBHOOK_SECRET=whsec_...
-//        APP_URL=https://yourapp.com           (for success/cancel redirects)
-//   4) In server.js:
-//        import { mountPayments } from "./payments.js";
-//        mountPayments(app, { auth, requireVendor });
-//      and REMOVE the old stub /api/billing/* and /api/payments/checkout routes.
-//   5) Add a Stripe webhook endpoint in the dashboard pointing to /api/billing/webhook.
-//
-// NOTE: the webhook route needs the RAW body, so it is registered with express.raw()
-// and must be added BEFORE any global express.json() — mountPayments handles ordering
-// by registering the webhook with its own parser.
+-- Event Vendors — schema v2 (reviews, bookings, notifications, password reset, vendor coords).
+-- Additive and idempotent: safe to run on top of the existing schema, and safe to re-run.
+-- You can paste this straight into the Supabase SQL Editor (no DB password needed).
 
-export async function mountPayments(app, { auth, requireVendor }) {
-  const key = process.env.STRIPE_SECRET_KEY;
-  if (!key) { console.warn("[payments] Stripe disabled — set STRIPE_SECRET_KEY to enable real charges."); return; }
+-- ── Reviews ──────────────────────────────────────────────────────────────────
+-- API: GET/POST /api/vendors/:id/reviews. Frontend field "text" maps to column "body",
+-- and "date" in responses can be derived from created_at.
+CREATE TABLE IF NOT EXISTS reviews (
+  id              BIGSERIAL PRIMARY KEY,
+  vendor_id       BIGINT NOT NULL REFERENCES vendors(id) ON DELETE CASCADE,
+  author_user_id  BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  author          TEXT NOT NULL DEFAULT 'Anonymous',
+  rating          INT  NOT NULL DEFAULT 5 CHECK (rating BETWEEN 1 AND 5),
+  body            TEXT NOT NULL DEFAULT '',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-  const Stripe = (await import("stripe")).default;
-  const stripe = new Stripe(key);
-  const express = (await import("express")).default;
-  const APP = process.env.APP_URL || "http://localhost:5173";
+-- ── Bookings ─────────────────────────────────────────────────────────────────
+-- API: POST /api/bookings {vendorId, date, guests}; GET /api/vendor/bookings.
+CREATE TABLE IF NOT EXISTS bookings (
+  id                BIGSERIAL PRIMARY KEY,
+  vendor_id         BIGINT NOT NULL REFERENCES vendors(id) ON DELETE CASCADE,
+  customer_user_id  BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  customer_name     TEXT NOT NULL DEFAULT '',
+  event_date        TEXT NOT NULL DEFAULT '',     -- stored as the displayed date string
+  guests            INT,
+  amount            INT NOT NULL DEFAULT 0,        -- deposit paid
+  status            TEXT NOT NULL DEFAULT 'confirmed'
+                      CHECK (status IN ('pending','confirmed','cancelled','completed')),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-  // Subscription checkout (vendor → Sponsored plan)
-  app.post("/api/billing/checkout", auth, requireVendor, async (req, res) => {
-    try {
-      const session = await stripe.checkout.sessions.create({
-        mode: "subscription",
-        line_items: [{ price: process.env.STRIPE_PRICE_SPONSORED, quantity: 1 }],
-        success_url: `${APP}/dash?upgrade=success`,
-        cancel_url: `${APP}/dash?upgrade=cancel`,
-        client_reference_id: String(req.user.id),
-        metadata: { userId: String(req.user.id), kind: "subscription" },
-      });
-      res.json({ url: session.url });
-    } catch (e) { console.error("[payments]", e.message); res.status(500).json({ error: "Checkout failed." }); }
-  });
+-- ── Notifications ────────────────────────────────────────────────────────────
+-- API: GET /api/notifications; POST /api/notifications/read. Field "text" -> column "body".
+CREATE TABLE IF NOT EXISTS notifications (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body        TEXT NOT NULL DEFAULT '',
+  read        BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-  // One-off booking deposit (customer → vendor)
-  app.post("/api/payments/checkout", auth, async (req, res) => {
-    try {
-      const { vendorId, date, guests, amount } = req.body || {};
-      const cents = Math.max(50, Math.round(Number(amount || 0) * 100));
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        line_items: [{
-          quantity: 1,
-          price_data: { currency: "usd", unit_amount: cents,
-            product_data: { name: `Booking deposit${date ? ` — ${date}` : ""}` } },
-        }],
-        success_url: `${APP}/?booking=success`,
-        cancel_url: `${APP}/?booking=cancel`,
-        client_reference_id: String(req.user.id),
-        metadata: { userId: String(req.user.id), vendorId: String(vendorId || ""), date: String(date || ""), guests: String(guests || ""), kind: "booking" },
-      });
-      res.json({ url: session.url });
-    } catch (e) { console.error("[payments]", e.message); res.status(500).json({ error: "Checkout failed." }); }
-  });
+-- ── Password reset tokens ────────────────────────────────────────────────────
+-- API: POST /api/auth/forgot {email}  -> create a row, email the raw token to the user.
+--      POST /api/auth/reset {token, password} -> look up by hash, check expiry/used, set password.
+-- Store only a HASH of the token (e.g. sha256), never the raw token.
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash  TEXT NOT NULL,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  used        BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-  // Webhook — needs the raw body, so its own parser is attached here.
-  app.post("/api/billing/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (e) { return res.status(400).send(`Webhook error: ${e.message}`); }
+-- ── Vendor coordinates (for accurate distance) ───────────────────────────────
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS lat NUMERIC(9,6);
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS lng NUMERIC(9,6);
 
-    if (event.type === "checkout.session.completed") {
-      const s = event.data.object;
-      const meta = s.metadata || {};
-      try {
-        const { repo } = await import("./repo.js");
-        if (meta.kind === "subscription" && meta.userId) {
-          await repo.setPlanByOwner(Number(meta.userId), "sponsored");
-        }
-        if (meta.kind === "booking" && meta.vendorId) {
-          const vendor = await repo.findVendorById(Number(meta.vendorId));
-          await repo.createBooking({
-            vendorId: Number(meta.vendorId), customerUserId: Number(meta.userId) || null,
-            date: meta.date || "", guests: meta.guests ? Number(meta.guests) : null,
-            amount: Math.round((s.amount_total || 0) / 100), status: "confirmed",
-          });
-          if (vendor && vendor.ownerUserId) await repo.createNotification(vendor.ownerUserId, `New paid booking${meta.date ? ` for ${meta.date}` : ""}.`);
-        }
-      } catch (e) { console.error("[payments] webhook handling failed:", e.message); }
-    }
-    res.json({ received: true });
-  });
+-- ── Indexes ──────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_reviews_vendor        ON reviews(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_vendor       ON bookings(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_bookings_customer     ON bookings(customer_user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user    ON notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_unread  ON notifications(user_id, read);
+CREATE INDEX IF NOT EXISTS idx_reset_tokens_hash     ON password_reset_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_reset_tokens_user     ON password_reset_tokens(user_id);
 
-  console.log("[payments] Stripe enabled.");
-}
+-- Optional: keep vendors.rating / vendors.reviews in sync after a review is added or
+-- removed (recompute AVG(rating) and COUNT(*) for that vendor) in your repo layer.
+
+-- ── Messaging (threads + messages) ───────────────────────────────────────────
+-- A thread is one conversation between a customer and a vendor.
+CREATE TABLE IF NOT EXISTS threads (
+  id                BIGSERIAL PRIMARY KEY,
+  customer_user_id  BIGINT REFERENCES users(id) ON DELETE CASCADE,
+  vendor_id         BIGINT REFERENCES vendors(id) ON DELETE CASCADE,
+  subject           TEXT NOT NULL DEFAULT '',
+  customer_unread   BOOLEAN NOT NULL DEFAULT FALSE,
+  vendor_unread     BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id          BIGSERIAL PRIMARY KEY,
+  thread_id   BIGINT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  sender      TEXT NOT NULL CHECK (sender IN ('customer','vendor')),
+  body        TEXT NOT NULL DEFAULT '',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_threads_customer ON threads(customer_user_id);
+CREATE INDEX IF NOT EXISTS idx_threads_vendor   ON threads(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_messages_thread  ON messages(thread_id);
