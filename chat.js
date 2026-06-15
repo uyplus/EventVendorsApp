@@ -10,8 +10,6 @@
  * To get an API key: https://console.anthropic.com
  */
 
-import rateLimit from "express-rate-limit";
-
 const SYSTEM_PROMPT = `
 You are the Event Vendors assistant — a friendly, knowledgeable helper on the Event Vendors marketplace (eventvendors.us). Event Vendors connects people planning events with trusted, independent service providers across the United States and Canada.
 
@@ -82,15 +80,10 @@ WHAT YOU CANNOT DO:
 Always be brief, warm, and helpful. Give actionable next steps. Never make up information about specific vendors or prices.
 `.trim();
 
-const chatLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 minute
-  max: 20,               // 20 messages per minute per IP
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many messages — please wait a moment and try again." },
-});
-
-export function mountChat(app) {
+export function mountChat(app, { rateLimit } = {}) {
+  const chatLimiter = rateLimit
+    ? rateLimit({ windowMs: 60 * 1000, max: 20 })
+    : (req, res, next) => next(); // no-op fallback if not provided
   app.post("/api/chat", chatLimiter, async (req, res) => {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {

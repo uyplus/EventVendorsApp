@@ -292,7 +292,7 @@ mountCompliance(app, {
     if (send) return send({ to, subject, html });
   },
 });
-mountChat(app);
+mountChat(app, { rateLimit });
 //   await mountPayments(app, { auth, requireVendor });
 
 /* ── boot ──────────────────────────────────────────────────────────────── */
