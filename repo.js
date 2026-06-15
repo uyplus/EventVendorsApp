@@ -21,11 +21,15 @@ const toVendor = (r) => r && ({
   city: r.city, region: r.region, country: r.country, distance: r.distance,
   rating: Number(r.rating), reviews: r.reviews, premium: r.premium, sponsored: r.sponsored,
   verified: r.verified, suspended: r.suspended, plan: r.plan, licensed: r.licensed,
+  licenceStatus: r.licence_status || (r.licensed ? "pending" : "none"),
+  licencePath: r.licence_path, licenceExpires: r.licence_expires,
+  insurancePath: r.insurance_path, insuranceStatus: r.insurance_status || "none",
   equipmentHire: r.equipment_hire, fullService: r.full_service, years: r.years,
   languages: r.languages || [], cuisines: r.cuisines, services: r.services || {},
   photos: r.photos || [], blockedDates: r.blocked_dates || [], about: r.about, pitch: r.pitch,
   businessAddress: r.business_address, businessPhone: r.business_phone, hue: r.hue,
-  maxPhotos: r.max_photos, createdAt: r.created_at,
+  maxPhotos: r.max_photos, createdAt: r.created_at, joinedAt: r.joined_at || r.created_at,
+  ownerEmail: r.owner_email,
 });
 const toReport = (r) => r && ({
   id: Number(r.id), vendorId: r.vendor_id == null ? null : Number(r.vendor_id),
@@ -259,5 +263,63 @@ export const repo = {
       return r.rows.map(toReport);
     }
     return (getDb().reports || []).filter((r) => (status ? r.status === status : true));
+  },
+
+  // ── compliance methods ──────────────────────────────────────────────────
+
+  async updateVendorCompliance(vendorId, fields) {
+    if (usingPg) {
+      const cols = Object.keys(fields);
+      const vals = Object.values(fields);
+      const set  = cols.map((c, i) => `${c}=$${i + 2}`).join(", ");
+      await query(`UPDATE vendors SET ${set} WHERE id=$1`, [vendorId, ...vals]);
+      return;
+    }
+    const v = getDb().vendors.find((x) => String(x.id) === String(vendorId));
+    if (v) { Object.assign(v, fields); memSave(); }
+  },
+
+  async getVendorsByLicenceStatus(status) {
+    if (usingPg) {
+      const r = await query(
+        `SELECT v.*, u.email AS owner_email FROM vendors v
+         LEFT JOIN users u ON u.id = v.owner_user_id
+         WHERE v.licence_status = $1 ORDER BY v.id DESC`, [status]);
+      return r.rows.map(toVendor);
+    }
+    return getDb().vendors.filter((v) => (v.licenceStatus || "none") === status).map(toVendor);
+  },
+
+  async getVendorById(id) {
+    if (usingPg) {
+      const r = await query(
+        `SELECT v.*, u.email AS owner_email FROM vendors v
+         LEFT JOIN users u ON u.id = v.owner_user_id
+         WHERE v.id = $1`, [id]);
+      return r.rows[0] ? toVendor(r.rows[0]) : null;
+    }
+    return getDb().vendors.find((v) => String(v.id) === String(id)) || null;
+  },
+
+  async logAdminAction({ adminEmail, action, targetType, targetId, reason }) {
+    if (usingPg) {
+      await query(
+        `INSERT INTO admin_actions (admin_email, action, target_type, target_id, reason)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [adminEmail, action, targetType, targetId, reason || null]);
+      return;
+    }
+    // in-memory: no-op (dev only)
+  },
+
+  async saveUserCompliance(userId, { termsAcceptedAt, termsVersion, contractorAck, joinedAt }) {
+    if (usingPg) {
+      await query(
+        `UPDATE users SET terms_accepted_at=$2, terms_version=$3, contractor_ack=$4, joined_at=COALESCE(joined_at,$5) WHERE id=$1`,
+        [userId, termsAcceptedAt || null, termsVersion || null, !!contractorAck, joinedAt || null]);
+      return;
+    }
+    const u = getDb().users?.find((x) => String(x.id) === String(userId));
+    if (u) { Object.assign(u, { termsAcceptedAt, termsVersion, contractorAck, joinedAt }); memSave(); }
   },
 };

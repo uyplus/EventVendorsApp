@@ -9,7 +9,7 @@ const v = (o) => ({
   cuisines: null, services: null, ...o,
 });
 
-export const SEED_VENDORS = [
+const ALL_SEED_VENDORS = [
   v({ name: "King Mike's Castles", cat: "decor", offering: "Inflatable rentals", price: 3, startingPrice: 100, city: "Calgary", region: "AB", country: "CA", distance: 4, rating: 4.6, reviews: 11600, premium: true, sponsored: true, equipmentHire: true, fullService: false, years: 9, languages: ["English", "French"], hue: 14 }),
   v({ name: "Chief Uyi's Inflatables", cat: "decor", offering: "Inflatable rentals", price: 2, startingPrice: 80, city: "Toronto", region: "ON", country: "CA", distance: 7, rating: 4.4, sponsored: true, equipmentHire: true, fullService: false, hue: 22 }),
   v({ name: "Offiong's Bouncing Castles", cat: "decor", offering: "Inflatable rentals", price: 2, startingPrice: 75, city: "Brampton", region: "ON", country: "CA", distance: 12, rating: 4.5, reviews: 980, equipmentHire: true, fullService: false, hue: 8 }),
@@ -50,3 +50,5 @@ export const SEED_VENDORS = [
   v({ name: "BrightStage Sound & Light", cat: "logi", offering: "Sound & lighting rental", price: 3, startingPrice: 150, city: "Abuja", region: "FCT", country: "NG", distance: 6, rating: 4.6, reviews: 670, equipmentHire: true, fullService: false, hue: 140 }),
   v({ name: "PowerUp Generators", cat: "logi", offering: "Power / generator rental", price: 2, startingPrice: 200, city: "Lagos", region: "Lagos", country: "NG", distance: 9, rating: 4.3, reviews: 350, equipmentHire: true, fullService: false, hue: 130 }),
 ];
+
+export const SEED_VENDORS = ALL_SEED_VENDORS.filter((x) => x.country === "US" || x.country === "CA");

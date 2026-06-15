@@ -7,6 +7,10 @@ import { hashPassword, checkPassword, signToken, publicUser, requireAuth, requir
 import { countries, statesOf, citiesOf, source as geoSource } from "./locations.js";
 import { billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } from "./billing.js";
 import { mountFeatures } from "./features.js";
+import { mountMedia } from "./media.js";
+import { mountCompliance } from "./compliance.js";
+import { mountChat } from "./chat.js";
+import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
 import { sendVerifyEmail, sendContactEmail } from "./email.js";
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
@@ -91,6 +95,14 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
     businessName: b.businessName || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
     services,
   });
+
+  // Store legal acceptance for compliance record-keeping.
+  await repo.saveUserCompliance(user.id, {
+    termsAcceptedAt: b.termsAcceptedAt || new Date().toISOString(),
+    termsVersion: b.termsVersion || "1.0",
+    contractorAck: role === "vendor" ? !!b.contractorAck : false,
+    joinedAt: b.joinedAt || new Date().toISOString(),
+  }).catch(() => {});
 
   if (role === "vendor") {
     const firstCat = Object.keys(services)[0];
@@ -222,41 +234,22 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.blockedDates !== undefined) patch.blockedDates = Array.isArray(b.blockedDates) ? b.blockedDates : [];
   if (b.name) patch.name = b.name;
   if (b.about !== undefined) patch.about = b.about;
-  // plan/sponsored normally come from the Stripe webhook; accepted here for the demo.
-  let maxPhotos = cur.maxPhotos || 3;
-  if (b.plan !== undefined) {
-    const plan = b.plan === "sponsored" ? "sponsored" : "free";
-    patch.plan = plan; patch.sponsored = plan === "sponsored"; maxPhotos = plan === "sponsored" ? 20 : 3; patch.maxPhotos = maxPhotos;
-  }
+  // Event Vendors is free — every listing gets the full photo allowance.
+  const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);
   const listing = await repo.updateVendorByOwner(req.user.id, patch, { name: `${req.user.firstName}'s Services`, services: req.user.services || {} });
   res.json(listing);
 }));
 
-/* ── billing ───────────────────────────────────────────────────────────── */
-app.get("/api/billing/mode", (req, res) => res.json({ mode: billingMode() }));
-
-app.post("/api/billing/subscribe", auth, requireVendor, h(async (req, res) => {
-  res.json(await createSubscriptionCheckout({ user: req.user }));
-}));
-
-app.post("/api/payments/checkout", h(async (req, res) => {
-  const { amount, vendorId, description, currency } = req.body || {};
-  if (!amount || amount <= 0) return res.status(400).json({ error: "amount required" });
-  res.json(await createPaymentCheckout({ amount, vendorId, description, currency }));
-}));
-
-// Stripe webhook — the ONLY place a vendor is granted/revoked Sponsored.
-app.post("/api/billing/webhook", h(async (req, res) => {
-  try {
-    const out = await handleWebhook({
-      rawBody: req.rawBody, signature: req.headers["stripe-signature"],
-      onSubscriptionActive: (uid) => repo.setPlanByOwner(uid, "sponsored"),
-      onSubscriptionCanceled: (uid) => repo.setPlanByOwner(uid, "free"),
-    });
-    res.json(out);
-  } catch (e) { res.status(400).json({ error: e.message }); }
-}));
+/* ── billing ── DORMANT ─────────────────────────────────────────────────────
+   Event Vendors is 100% free. Subscriptions & payments are intentionally
+   disabled. billing.js / payments.js remain in the repo but are not wired to
+   any active route. To re-enable paid tiers later, restore the handlers and
+   configure Stripe keys.                                                       */
+app.get("/api/billing/mode", (req, res) => res.json({ mode: "disabled" }));
+app.post("/api/billing/subscribe", (req, res) => res.status(410).json({ error: "Subscriptions are disabled — Event Vendors is free." }));
+app.post("/api/payments/checkout", (req, res) => res.status(410).json({ error: "Payments are disabled — Event Vendors is free." }));
+app.post("/api/billing/webhook", (req, res) => res.status(410).json({ error: "Billing is disabled." }));
 
 /* ── community reports + admin moderation ──────────────────────────────── */
 app.post("/api/reports", h(async (req, res) => {
@@ -291,7 +284,15 @@ app.delete("/api/admin/vendors/:id", admin, h(async (req, res) => {
 /* ── new feature endpoints (reviews, bookings, notifications, messaging, password reset) ── */
 mountFeatures(app, { auth, requireVendor, repo });
 // To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
-//   mountMedia(app, { auth, requireVendor });
+mountMedia(app, { auth, requireVendor });
+mountCompliance(app, {
+  auth, requireVendor, repo,
+  sendEmail: async ({ to, subject, html }) => {
+    const { send } = await import("./email.js").catch(() => ({}));
+    if (send) return send({ to, subject, html });
+  },
+});
+mountChat(app);
 //   await mountPayments(app, { auth, requireVendor });
 
 /* ── boot ──────────────────────────────────────────────────────────────── */

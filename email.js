@@ -93,3 +93,33 @@ export function sendSubscriptionThankYou(to, name) {
 export function sendNotificationEmail(to, text) {
   return send({ to, subject: "New activity on Event Vendors", html: shell("You have a new notification", `<p>${text}</p>`) });
 }
+
+export function sendLicenceVerifiedEmail(to, vendorName) {
+  return send({
+    to, subject: "Your licence has been verified ✅ — Event Vendors",
+    html: shell("Licence verified", `
+      <p>Hi ${vendorName},</p>
+      <p>Great news — our team has reviewed your credential and your <b>Licensed</b> badge is now live on your listing.</p>
+      <p>Customers can now see that you hold a valid licence for your service, which increases trust and booking conversions.</p>
+      <p style="text-align:center;margin:24px 0"><a href="${process.env.APP_URL}" style="background:#2F8F6B;color:#fff;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:700">View your listing →</a></p>
+      <p style="font-size:12px;color:#8a8594">Remember to update your licence document before it expires to keep the badge active.</p>`),
+  });
+}
+
+export function sendLicenceRejectedEmail(to, vendorName, reason) {
+  return send({
+    to, subject: "Action required: Licence submission — Event Vendors",
+    html: shell("Licence review update", `
+      <p>Hi ${vendorName},</p>
+      <p>Our team reviewed your licence submission but was unable to verify it${reason ? `: <b>${reason}</b>` : "."}.</p>
+      <p>Please log in to your vendor dashboard and upload a clear, valid copy of your credential. Common issues:</p>
+      <ul>
+        <li>File is blurry or partially cropped — make sure all details are visible</li>
+        <li>Licence has expired — upload a current, valid credential</li>
+        <li>Wrong document type — upload the specific licence required for your service</li>
+      </ul>
+      <p style="text-align:center;margin:24px 0"><a href="${process.env.APP_URL}" style="background:#E26D4F;color:#fff;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:700">Update your listing →</a></p>
+      <p style="font-size:12px;color:#8a8594">If you believe this is an error, please contact us at ${process.env.CONTACT_TO || "eventvendors.ca@gmail.com"}.</p>`),
+  });
+}
+
