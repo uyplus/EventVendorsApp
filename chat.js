@@ -90,7 +90,14 @@ export function mountChat(app, { rateLimit } = {}) {
       return res.status(503).json({ error: "AI chat is not configured on this server. Set ANTHROPIC_API_KEY in your Render environment variables." });
     }
 
-    const { messages } = req.body || {};
+    const { messages, lang } = req.body || {};
+
+    // Map lang code to a human-readable language name for the prompt
+    const LANG_NAMES = { en:"English", fr:"French", es:"Spanish", pt:"Portuguese", de:"German", it:"Italian", nl:"Dutch", fi:"Finnish", ru:"Russian", tr:"Turkish", id:"Indonesian", sw:"Swahili", hi:"Hindi", ar:"Arabic", zh:"Mandarin Chinese" };
+    const langName = LANG_NAMES[lang] || "English";
+    const langInstruction = lang && lang !== "en"
+      ? `\n\nIMPORTANT: The user has selected ${langName} as their language. You MUST respond entirely in ${langName}, regardless of what language the user writes in. Keep the same warm, helpful tone.`
+      : "";
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array is required." });
     }
@@ -116,7 +123,7 @@ export function mountChat(app, { rateLimit } = {}) {
         body: JSON.stringify({
           model: "claude-haiku-4-5-20251001",
           max_tokens: 400,
-          system: SYSTEM_PROMPT,
+          system: SYSTEM_PROMPT + langInstruction,
           messages: sanitised,
         }),
       });

@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { repo } from "./repo.js";
+import { query, usingPg } from "./db.js";
 import { ensureSeeded } from "./seed.js";
 import { CATEGORIES, LICENSE_BY_OFFERING, CUISINE_OPTIONS } from "./taxonomy.js";
 import { hashPassword, checkPassword, signToken, publicUser, requireAuth, requireVendor, requireAdmin } from "./auth.js";
@@ -10,6 +11,7 @@ import { mountFeatures } from "./features.js";
 import { mountMedia } from "./media.js";
 import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
+import { mountAnalytics } from "./analytics.js";
 import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
 import { sendVerifyEmail, sendContactEmail } from "./email.js";
 
@@ -293,6 +295,7 @@ mountCompliance(app, {
   },
 });
 mountChat(app, { rateLimit });
+mountAnalytics(app, { rateLimit, query, usingPg, admin });
 //   await mountPayments(app, { auth, requireVendor });
 
 /* ── boot ──────────────────────────────────────────────────────────────── */
