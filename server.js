@@ -50,6 +50,17 @@ app.get("/api/locations/states", (req, res) => res.json(statesOf(req.query.count
 app.get("/api/locations/cities", (req, res) => res.json(citiesOf(req.query.country || "", req.query.state || "")));
 app.get("/api/locations/meta", (req, res) => res.json({ source: geoSource(), countryCount: countries().length }));
 
+// ── Public landing-page stats — used by the hero stats row. No auth needed. ──
+app.get("/api/stats/summary", h(async (req, res) => {
+  const vendors = await repo.listActiveVendors().catch(() => []);
+  const countrySet = new Set(vendors.map((v) => v.country).filter(Boolean));
+  res.json({
+    vendors: vendors.length,
+    categories: 7,
+    countries: Math.max(countrySet.size, 2), // US + Canada minimum, even pre-launch
+  });
+}));
+
 /* ── auth ──────────────────────────────────────────────────────────────── */
 const rl = new Map();
 function rateLimit({ windowMs, max }) {
