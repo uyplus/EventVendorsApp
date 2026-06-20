@@ -13,7 +13,7 @@ import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
 import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
-import { sendVerifyEmail, sendContactEmail } from "./email.js";
+import { sendVerifyEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
@@ -287,6 +287,8 @@ app.post("/api/reports", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(asy
   const b = req.body || {};
   if (!b.vendorId && !b.userId) return res.status(400).json({ error: "vendorId or userId is required." });
   const id = await repo.createReport({ vendorId: b.vendorId, userId: b.userId, reason: (b.reason || "").slice(0, 1000), reasons: Array.isArray(b.reasons) ? b.reasons.slice(0, 12) : [], reporterEmail: b.reporterEmail || "" });
+  // Notify the admin team immediately — reports should never sit unseen in the database.
+  sendReportNotificationEmail({ vendorId: b.vendorId, userId: b.userId, reasons: b.reasons, reason: b.reason, reporterEmail: b.reporterEmail }).catch((e) => console.error("[reports] notification email failed:", e.message));
   res.status(201).json({ ok: true, id });
 }));
 

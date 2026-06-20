@@ -94,6 +94,22 @@ export function sendNotificationEmail(to, text) {
   return send({ to, subject: "New activity on Event Vendors", html: shell("You have a new notification", `<p>${text}</p>`) });
 }
 
+export function sendReportNotificationEmail({ vendorId, userId, reasons, reason, reporterEmail }) {
+  const to = process.env.CONTACT_TO || "eventvendors.ca@gmail.com";
+  const target = vendorId ? `Vendor #${vendorId}` : `User #${userId}`;
+  return send({
+    to, subject: `[Report] ${target} flagged — review needed`,
+    html: shell("New violation report submitted", `
+      <p><b>Reported:</b> ${target}</p>
+      <p><b>Reasons:</b> ${(reasons || []).join(", ") || "(none given)"}</p>
+      <p><b>Reporter:</b> ${reporterEmail || "(not provided)"}</p>
+      <hr style="border:none;border-top:1px solid #eee;margin:14px 0" />
+      <p style="white-space:pre-wrap">${(reason || "(no additional details)").replace(/</g, "&lt;")}</p>
+      <p style="margin-top:18px"><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#E26D4F;color:#fff;padding:10px 20px;border-radius:10px;text-decoration:none;font-weight:700">Review in Moderation Panel →</a></p>
+      <p style="font-size:12px;color:#8a8594;margin-top:10px">Log in with an admin account → Settings → Open moderation → Reports tab.</p>`),
+  });
+}
+
 export function sendLicenceVerifiedEmail(to, vendorName) {
   return send({
     to, subject: "Your licence has been verified ✅ — Event Vendors",

@@ -47,6 +47,7 @@ export function requireVendor(req, res, next) {
 
 // Admin gate: a valid X-Admin-Key header, or a logged-in user whose role is "admin".
 export function requireAdmin(repo) {
+  const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
   return async (req, res, next) => {
     const key = req.headers["x-admin-key"];
     if (process.env.ADMIN_KEY && key && key === process.env.ADMIN_KEY) return next();
@@ -56,7 +57,8 @@ export function requireAdmin(repo) {
       try {
         const payload = jwt.verify(token, SECRET);
         const u = await repo.findUserById(payload.id);
-        if (u && u.role === "admin") { req.user = u; return next(); }
+        const email = (u?.email || "").toLowerCase();
+        if (u && ADMIN_EMAILS.length && ADMIN_EMAILS.includes(email)) { req.user = u; return next(); }
       } catch (e) { /* fall through */ }
     }
     return res.status(403).json({ error: "Admin access required." });
