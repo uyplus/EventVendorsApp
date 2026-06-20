@@ -21,6 +21,24 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(cors({ origin: (process.env.CORS_ORIGIN || "*").split(","), credentials: true }));
 
+// ── baseline security headers ───────────────────────────────────────────────
+// Lightweight, dependency-free defense-in-depth. The frontend (served by
+// Netlify) carries its own header set in netlify.toml — these cover the API.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "geolocation=(), camera=(), microphone=()");
+  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  next();
+});
+
+// ── global baseline rate limit ──────────────────────────────────────────────
+// Generous per-IP-per-path ceiling so no single endpoint can be hammered or
+// scraped. Sensitive routes (signup/login/contact) layer a stricter limit
+// on top of this — see their individual rateLimit(...) calls below.
+app.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
+
 const auth = requireAuth(repo);
 const admin = requireAdmin(repo);
 const COUNTRY_NAME = { US: "United States", CA: "Canada", NG: "Nigeria" };
@@ -224,7 +242,7 @@ app.get("/api/vendors/:id", h(async (req, res) => {
 }));
 
 /* ── quotes ────────────────────────────────────────────────────────────── */
-app.post("/api/quotes", h(async (req, res) => {
+app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
   const b = req.body || {};
   if (!b.vendorId) return res.status(400).json({ error: "vendorId is required." });
   const id = await repo.createQuote(b);
@@ -265,7 +283,7 @@ app.post("/api/payments/checkout", (req, res) => res.status(410).json({ error: "
 app.post("/api/billing/webhook", (req, res) => res.status(410).json({ error: "Billing is disabled." }));
 
 /* ── community reports + admin moderation ──────────────────────────────── */
-app.post("/api/reports", h(async (req, res) => {
+app.post("/api/reports", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(async (req, res) => {
   const b = req.body || {};
   if (!b.vendorId && !b.userId) return res.status(400).json({ error: "vendorId or userId is required." });
   const id = await repo.createReport({ vendorId: b.vendorId, userId: b.userId, reason: (b.reason || "").slice(0, 1000), reasons: Array.isArray(b.reasons) ? b.reasons.slice(0, 12) : [], reporterEmail: b.reporterEmail || "" });
