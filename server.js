@@ -141,7 +141,8 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
     await repo.createVendor({
       ownerUserId: user.id, name: (b.businessName || `${user.firstName}'s Services`).trim(),
       cat: firstCat || "mgmt", offering: firstOffering || "Full event planning",
-      price: 2, startingPrice: 0, city: user.city, region: user.state, country: user.country || "US",
+      price: 2, startingPrice: b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null),
+      city: user.city, region: user.state, country: user.country || "US",
       licensed: !!b.licensed, fullService: true,
       languages: Array.isArray(b.languagesSpoken) && b.languagesSpoken.length ? b.languagesSpoken : ["English"],
       about: b.pitch || "", pitch: b.pitch || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
@@ -269,6 +270,7 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.about !== undefined) patch.about = b.about;
   if (b.experienceSinceYear !== undefined) patch.experienceSinceYear = b.experienceSinceYear;
   if (b.serviceAreas !== undefined) patch.serviceAreas = Array.isArray(b.serviceAreas) ? b.serviceAreas : [];
+  if (b.startingPrice !== undefined) patch.startingPrice = b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null);
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);
