@@ -24,8 +24,10 @@ const upload = multer({
 
 // allow common image + video formats only
 const ALLOWED = /^(image\/(jpeg|png|webp|gif)|video\/(mp4|quicktime|webm))$/;
+// price lists / menus also allow PDF, since that's the most common format vendors already have
+const ALLOWED_DOC = /^(image\/(jpeg|png|webp)|application\/pdf)$/;
 
-export function mountMedia(app, { auth, requireVendor }) {
+export function mountMedia(app, { auth, requireVendor, repo }) {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
   const bucket = process.env.SUPABASE_BUCKET || "vendor-media";
@@ -54,6 +56,33 @@ export function mountMedia(app, { auth, requireVendor }) {
       res.status(201).json({ url: data.publicUrl, type: req.file.mimetype.startsWith("video/") ? "video" : "image" });
     } catch (e) {
       console.error("[media] upload failed:", e.message);
+      res.status(500).json({ error: "Upload failed." });
+    }
+  });
+
+  // Price list / menu — a single document, shown to customers via a
+  // "View price list" / "View menu" button on the listing. Public bucket,
+  // since (unlike licence/insurance documents) this is marketing material
+  // meant to be seen.
+  app.post("/api/vendor/price-list", auth, requireVendor, upload.single("file"), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+      if (!ALLOWED_DOC.test(req.file.mimetype)) return res.status(400).json({ error: "Please upload a PDF or image." });
+
+      const ext = (req.file.originalname.split(".").pop() || "pdf").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const path = `vendor-${req.user.id}/price-list-${Date.now()}.${ext}`;
+
+      const { error } = await supabase.storage.from(bucket).upload(path, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: true,
+      });
+      if (error) throw error;
+
+      const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+      if (repo) await repo.updateVendorByOwner(req.user.id, { priceListPath: data.publicUrl }).catch(() => {});
+      res.status(201).json({ url: data.publicUrl });
+    } catch (e) {
+      console.error("[media] price-list upload failed:", e.message);
       res.status(500).json({ error: "Upload failed." });
     }
   });

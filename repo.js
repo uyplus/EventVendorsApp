@@ -30,6 +30,9 @@ const toVendor = (r) => r && ({
   businessAddress: r.business_address, businessPhone: r.business_phone, hue: r.hue,
   maxPhotos: r.max_photos, createdAt: r.created_at, joinedAt: r.joined_at || r.created_at,
   ownerEmail: r.owner_email,
+  experienceSinceYear: r.experience_since_year ?? null,
+  serviceAreas: r.service_areas || [],
+  priceListPath: r.price_list_path || null,
 });
 const toReport = (r) => r && ({
   id: Number(r.id), vendorId: r.vendor_id == null ? null : Number(r.vendor_id),
@@ -150,14 +153,15 @@ export const repo = {
   async createVendor(v) {
     if (usingPg) {
       const r = await query(
-        `INSERT INTO vendors (owner_user_id,name,cat,offering,price,starting_price,city,region,country,distance,rating,reviews,premium,sponsored,verified,plan,licensed,equipment_hire,full_service,years,languages,cuisines,services,photos,about,pitch,business_address,business_phone,hue,max_photos)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30) RETURNING *`,
+        `INSERT INTO vendors (owner_user_id,name,cat,offering,price,starting_price,city,region,country,distance,rating,reviews,premium,sponsored,verified,plan,licensed,equipment_hire,full_service,years,languages,cuisines,services,photos,about,pitch,business_address,business_phone,hue,max_photos,experience_since_year,service_areas,price_list_path)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33) RETURNING *`,
         [v.ownerUserId ?? null, v.name || "", v.cat || "mgmt", v.offering || "", v.price ?? 2, v.startingPrice ?? 0,
          v.city || "", v.region || "", v.country || "US", v.distance ?? 0, v.rating ?? 0, v.reviews ?? 0,
          !!v.premium, !!v.sponsored, !!v.verified, v.plan || "free", !!v.licensed, !!v.equipmentHire,
          v.fullService === undefined ? true : !!v.fullService, v.years ?? 0, J(v.languages || ["English"]),
          J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
-         v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3]);
+         v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3,
+         v.experienceSinceYear ?? null, J(v.serviceAreas || []), v.priceListPath || null]);
       return toVendor(r.rows[0]);
     }
     const db = getDb();
@@ -170,7 +174,8 @@ export const repo = {
       years: v.years ?? 0, languages: v.languages || ["English"], cuisines: v.cuisines ?? null,
       services: v.services || {}, photos: v.photos || [], blockedDates: [], about: v.about || "",
       pitch: v.pitch || "", businessAddress: v.businessAddress || "", businessPhone: v.businessPhone || "",
-      hue: v.hue ?? 200, maxPhotos: v.maxPhotos ?? 3, createdAt: new Date().toISOString() };
+      hue: v.hue ?? 200, maxPhotos: v.maxPhotos ?? 3, createdAt: new Date().toISOString(),
+      experienceSinceYear: v.experienceSinceYear ?? null, serviceAreas: v.serviceAreas || [], priceListPath: v.priceListPath || null };
     db.vendors.push(vendor); memSave(); return vendor;
   },
 
@@ -197,10 +202,12 @@ export const repo = {
     if (usingPg) {
       const r = await query(
         `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
-           licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12 WHERE id=$1 RETURNING *`,
+           licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
+           experience_since_year=$13, service_areas=$14, price_list_path=$15 WHERE id=$1 RETURNING *`,
         [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
          J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
-         !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || [])]);
+         !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
+         merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null]);
       return toVendor(r.rows[0]);
     }
     Object.assign(listing, patch); memSave(); return listing;

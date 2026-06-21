@@ -146,6 +146,8 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       languages: Array.isArray(b.languagesSpoken) && b.languagesSpoken.length ? b.languagesSpoken : ["English"],
       about: b.pitch || "", pitch: b.pitch || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
       cuisines: b.cuisines && b.cuisines.length ? b.cuisines : null, services, hue: 200,
+      experienceSinceYear: b.experienceSinceYear ?? null,
+      serviceAreas: Array.isArray(b.serviceAreas) ? b.serviceAreas : [],
     });
   }
   // Send a registration confirmation / verification email with an activation link.
@@ -265,6 +267,8 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.blockedDates !== undefined) patch.blockedDates = Array.isArray(b.blockedDates) ? b.blockedDates : [];
   if (b.name) patch.name = b.name;
   if (b.about !== undefined) patch.about = b.about;
+  if (b.experienceSinceYear !== undefined) patch.experienceSinceYear = b.experienceSinceYear;
+  if (b.serviceAreas !== undefined) patch.serviceAreas = Array.isArray(b.serviceAreas) ? b.serviceAreas : [];
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);
@@ -317,7 +321,7 @@ app.delete("/api/admin/vendors/:id", admin, h(async (req, res) => {
 /* ── new feature endpoints (reviews, bookings, notifications, messaging, password reset) ── */
 mountFeatures(app, { auth, requireVendor, repo });
 // To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
-mountMedia(app, { auth, requireVendor });
+mountMedia(app, { auth, requireVendor, repo });
 mountCompliance(app, {
   auth, requireVendor, repo,
   sendEmail: async ({ to, subject, html }) => {
