@@ -55,7 +55,7 @@ async function getSignedUrl(bucket, path, expiresIn = 3600) {
 
 // ── route factory ─────────────────────────────────────────────────────────────
 
-export function mountCompliance(app, { auth, requireVendor, repo, sendEmail }) {
+export function mountCompliance(app, { auth, requireVendor, repo, sendEmail, sendLicenceVerifiedEmail, sendLicenceRejectedEmail }) {
   const h = (fn) => (req, res) => fn(req, res).catch(err => {
     console.error("[compliance]", err.message);
     res.status(500).json({ error: err.message });
@@ -129,19 +129,18 @@ export function mountCompliance(app, { auth, requireVendor, repo, sendEmail }) {
       reason:      reason || null,
     });
 
-    // Email the vendor
+    // Email the vendor — the dedicated templates explain what happened and
+    // (for rejections) what to fix, rather than a generic notice.
     const vendor = await repo.getVendorById(vendorId);
     if (vendor?.owner_email) {
-      const subject = decision === "verified"
-        ? "Your licence has been verified — Event Vendors 🎉"
-        : "Action required: Licence submission needs attention — Event Vendors";
-      const html = decision === "verified"
-        ? `<p>Great news! Your licence has been verified and your <b>Licensed</b> badge is now live on your listing.</p>
-           <p><a href="${process.env.APP_URL}">View your listing →</a></p>`
-        : `<p>We were unable to verify the licence document you submitted${reason ? `: <b>${reason}</b>` : "."}.</p>
-           <p>Please log in and upload a clear, valid copy of your credential.</p>
-           <p><a href="${process.env.APP_URL}">Update your listing →</a></p>`;
-      await sendEmail({ to: vendor.owner_email, subject, html }).catch(() => {});
+      const sendFn = decision === "verified" ? sendLicenceVerifiedEmail : sendLicenceRejectedEmail;
+      if (sendFn) {
+        await sendFn(vendor.owner_email, vendor.name || "there", reason).catch(() => {});
+      } else if (sendEmail) {
+        // fallback if the dedicated templates weren't wired in for some reason
+        const subject = decision === "verified" ? "Your licence has been verified — Event Vendors 🎉" : "Action required: Licence submission needs attention — Event Vendors";
+        await sendEmail({ to: vendor.owner_email, subject, html: `<p>Your licence was ${decision}.</p>` }).catch(() => {});
+      }
     }
 
     res.json({ ok: true, decision });

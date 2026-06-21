@@ -381,6 +381,7 @@ mountCompliance(app, {
     const { send } = await import("./email.js").catch(() => ({}));
     if (send) return send({ to, subject, html });
   },
+  sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
 });
 mountChat(app, { rateLimit });
 mountAnalytics(app, { rateLimit, query, usingPg, admin });
