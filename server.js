@@ -42,6 +42,11 @@ app.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
 const auth = requireAuth(repo);
 const admin = requireAdmin(repo);
 const COUNTRY_NAME = { US: "United States", CA: "Canada", NG: "Nigeria" };
+// Signup sends the full country name ("United States"); every other vendor
+// record (seed data, demo signups) stores the 2-letter code ("US"). Convert
+// here so a backend-created vendor's country always matches that convention
+// — otherwise it silently fails every country-based filter downstream.
+const codeForCountryName = (name) => Object.entries(COUNTRY_NAME).find(([, n]) => n === name)?.[0] || (name || "US");
 
 // limit a services object to max 3 offerings per category, keeping only valid offerings
 function sanitizeServices(services) {
@@ -122,7 +127,7 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
     role, email, passwordHash: hashPassword(b.password), verified: false, emailToken,
     firstName: (b.firstName || email.split("@")[0]).trim(), lastName: (b.lastName || "").trim(),
     phone: b.phone || "", address1: b.address1 || "", address2: b.address2 || "",
-    city: b.city || "", state: b.state || "", postal: b.postal || "", country: b.country || "",
+    city: b.city || "", state: b.state || "", postal: b.postal || "", country: codeForCountryName(b.country),
     businessName: b.businessName || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
     services,
   });
