@@ -152,17 +152,36 @@ export const repo = {
   /* ── vendors ────────────────────────────────────────────────────────── */
   async createVendor(v) {
     if (usingPg) {
-      const r = await query(
-        `INSERT INTO vendors (owner_user_id,name,cat,offering,price,starting_price,city,region,country,distance,rating,reviews,premium,sponsored,verified,plan,licensed,equipment_hire,full_service,years,languages,cuisines,services,photos,about,pitch,business_address,business_phone,hue,max_photos,experience_since_year,service_areas,price_list_path)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33) RETURNING *`,
-        [v.ownerUserId ?? null, v.name || "", v.cat || "mgmt", v.offering || "", v.price ?? 2, v.startingPrice === undefined ? 0 : v.startingPrice,
-         v.city || "", v.region || "", v.country || "US", v.distance ?? 0, v.rating ?? 0, v.reviews ?? 0,
-         !!v.premium, !!v.sponsored, !!v.verified, v.plan || "free", !!v.licensed, !!v.equipmentHire,
-         v.fullService === undefined ? true : !!v.fullService, v.years ?? 0, J(v.languages || ["English"]),
-         J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
-         v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3,
-         v.experienceSinceYear ?? null, J(v.serviceAreas || []), v.priceListPath || null]);
-      return toVendor(r.rows[0]);
+      try {
+        const r = await query(
+          `INSERT INTO vendors (owner_user_id,name,cat,offering,price,starting_price,city,region,country,distance,rating,reviews,premium,sponsored,verified,plan,licensed,equipment_hire,full_service,years,languages,cuisines,services,photos,about,pitch,business_address,business_phone,hue,max_photos,experience_since_year,service_areas,price_list_path)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33) RETURNING *`,
+          [v.ownerUserId ?? null, v.name || "", v.cat || "mgmt", v.offering || "", v.price ?? 2, v.startingPrice === undefined ? 0 : v.startingPrice,
+           v.city || "", v.region || "", v.country || "US", v.distance ?? 0, v.rating ?? 0, v.reviews ?? 0,
+           !!v.premium, !!v.sponsored, !!v.verified, v.plan || "free", !!v.licensed, !!v.equipmentHire,
+           v.fullService === undefined ? true : !!v.fullService, v.years ?? 0, J(v.languages || ["English"]),
+           J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
+           v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3,
+           v.experienceSinceYear ?? null, J(v.serviceAreas || []), v.priceListPath || null]);
+        return toVendor(r.rows[0]);
+      } catch (e) {
+        // Defensive fallback: if experience_since_year / service_areas / price_list_path
+        // don't exist yet (schema_v5.sql / schema_v6.sql not run), don't let a brand new
+        // vendor signup fail outright — create the listing with the original column set
+        // and log clearly so this is easy to spot in Render's logs.
+        if (!/column .* does not exist/i.test(e.message)) throw e;
+        console.error("[repo] createVendor: newer columns missing — run schema_v5.sql and schema_v6.sql in Supabase. Falling back. Detail:", e.message);
+        const r = await query(
+          `INSERT INTO vendors (owner_user_id,name,cat,offering,price,starting_price,city,region,country,distance,rating,reviews,premium,sponsored,verified,plan,licensed,equipment_hire,full_service,years,languages,cuisines,services,photos,about,pitch,business_address,business_phone,hue,max_photos)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30) RETURNING *`,
+          [v.ownerUserId ?? null, v.name || "", v.cat || "mgmt", v.offering || "", v.price ?? 2, v.startingPrice || 0,
+           v.city || "", v.region || "", v.country || "US", v.distance ?? 0, v.rating ?? 0, v.reviews ?? 0,
+           !!v.premium, !!v.sponsored, !!v.verified, v.plan || "free", !!v.licensed, !!v.equipmentHire,
+           v.fullService === undefined ? true : !!v.fullService, v.years ?? 0, J(v.languages || ["English"]),
+           J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
+           v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3]);
+        return toVendor(r.rows[0]);
+      }
     }
     const db = getDb();
     const vendor = { id: nextId("vendor"), ownerUserId: v.ownerUserId ?? null, name: v.name || "",
@@ -201,16 +220,28 @@ export const repo = {
     if (!listing) listing = await this.createVendor({ ownerUserId: userId, ...ownerDefaults });
     const merged = { ...listing, ...patch };
     if (usingPg) {
-      const r = await query(
-        `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
-           licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
-           experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16 WHERE id=$1 RETURNING *`,
-        [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
-         J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
-         !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
-         merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
-         merged.startingPrice === undefined ? null : merged.startingPrice]);
-      return toVendor(r.rows[0]);
+      try {
+        const r = await query(
+          `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
+             licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
+             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16 WHERE id=$1 RETURNING *`,
+          [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
+           J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
+           !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
+           merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
+           merged.startingPrice === undefined ? null : merged.startingPrice]);
+        return toVendor(r.rows[0]);
+      } catch (e) {
+        if (!/column .* does not exist/i.test(e.message)) throw e;
+        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql and schema_v6.sql in Supabase. Falling back. Detail:", e.message);
+        const r = await query(
+          `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
+             licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12 WHERE id=$1 RETURNING *`,
+          [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
+           J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
+           !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || [])]);
+        return toVendor(r.rows[0]);
+      }
     }
     Object.assign(listing, patch); memSave(); return listing;
   },
