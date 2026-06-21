@@ -283,6 +283,52 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   res.json(listing);
 }));
 
+/* ── messaging — two-sided: customer ⇄ vendor, one thread per pair ──────── */
+app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
+  const { vendorId, subject, body, kind } = req.body || {};
+  if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
+  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind });
+  await repo.addThreadMessage(thread.id, "customer", body);
+  res.status(201).json({ ok: true, threadId: "th" + thread.id });
+}));
+
+app.get("/api/threads", auth, h(async (req, res) => {
+  if (req.user.role === "vendor") {
+    const listing = await repo.findVendorByOwner(req.user.id);
+    if (!listing) return res.json([]);
+    return res.json(await repo.listThreadsFor({ role: "vendor", vendorId: listing.id }));
+  }
+  res.json(await repo.listThreadsFor({ role: "customer", userId: req.user.id }));
+}));
+
+app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
+  const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
+  const { body } = req.body || {};
+  if (!body) return res.status(400).json({ error: "body is required." });
+  await repo.addThreadMessage(threadId, req.user.role === "vendor" ? "vendor" : "customer", body);
+  res.status(201).json({ ok: true });
+}));
+
+/* ── bookings — free, confirmed immediately, no payment involved ────────── */
+app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
+  const { vendorId, date, guests, location } = req.body || {};
+  if (!vendorId) return res.status(400).json({ error: "vendorId is required." });
+  const customerName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Customer";
+  const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, eventDate: date || null, guests: guests || null, location: location || "" });
+  // Drop a thread message too, so the booking shows up in the vendor's inbox as well as their bookings list.
+  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking confirmed", kind: "booking" }).catch(() => null);
+  if (thread) await repo.addThreadMessage(thread.id, "customer", `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`).catch(() => {});
+  res.status(201).json({ ok: true, id: "bk" + booking.id });
+}));
+
+app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.json([]);
+  res.json(await repo.listBookingsForVendor(listing.id));
+}));
+
+app.get("/api/bookings", auth, h(async (req, res) => res.json(await repo.listBookingsForCustomer(req.user.id))));
+
 /* ── billing ── DORMANT ─────────────────────────────────────────────────────
    Event Vendors is 100% free. Subscriptions & payments are intentionally
    disabled. billing.js / payments.js remain in the repo but are not wired to

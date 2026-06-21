@@ -362,4 +362,121 @@ export const repo = {
     const u = getDb().users?.find((x) => String(x.id) === String(userId));
     if (u) { Object.assign(u, { termsAcceptedAt, termsVersion, contractorAck, joinedAt }); memSave(); }
   },
+
+  // ── messaging (two-sided: a thread links one customer + one vendor) ──────
+
+  async getOrCreateThread({ vendorId, customerId, subject, kind }) {
+    if (usingPg) {
+      const existing = await query(`SELECT * FROM threads WHERE vendor_id=$1 AND customer_id=$2`, [vendorId, customerId]);
+      if (existing.rows[0]) return existing.rows[0];
+      const r = await query(
+        `INSERT INTO threads (vendor_id, customer_id, subject, kind) VALUES ($1,$2,$3,$4) RETURNING *`,
+        [vendorId, customerId, subject || "Enquiry", kind || "message"]);
+      return r.rows[0];
+    }
+    const db = getDb();
+    db.threads = db.threads || [];
+    let t = db.threads.find((x) => x.vendorId === vendorId && x.customerId === customerId);
+    if (!t) { t = { id: nextId("thread"), vendorId, customerId, subject: subject || "Enquiry", kind: kind || "message", createdAt: new Date().toISOString() }; db.threads.push(t); memSave(); }
+    return t;
+  },
+
+  async addThreadMessage(threadId, senderRole, body) {
+    if (usingPg) {
+      const r = await query(
+        `INSERT INTO thread_messages (thread_id, sender_role, body) VALUES ($1,$2,$3) RETURNING *`,
+        [threadId, senderRole, body]);
+      return r.rows[0];
+    }
+    const db = getDb();
+    db.threadMessages = db.threadMessages || [];
+    const m = { id: nextId("msg"), threadId, senderRole, body, read: false, createdAt: new Date().toISOString() };
+    db.threadMessages.push(m); memSave(); return m;
+  },
+
+  // Threads + their messages, for whichever side (customer or vendor) is asking.
+  async listThreadsFor({ role, userId, vendorId }) {
+    if (usingPg) {
+      const where = role === "vendor" ? `t.vendor_id = $1` : `t.customer_id = $1`;
+      const param = role === "vendor" ? vendorId : userId;
+      const threads = (await query(
+        `SELECT t.*, v.name AS vendor_name, u.first_name, u.last_name
+         FROM threads t
+         JOIN vendors v ON v.id = t.vendor_id
+         JOIN users u ON u.id = t.customer_id
+         WHERE ${where} ORDER BY t.created_at DESC`, [param])).rows;
+      const out = [];
+      for (const t of threads) {
+        const msgs = (await query(`SELECT * FROM thread_messages WHERE thread_id=$1 ORDER BY created_at ASC`, [t.id])).rows;
+        out.push({
+          id: "th" + t.id, vendorId: t.vendor_id, vendorName: t.vendor_name,
+          customerName: `${t.first_name || ""} ${t.last_name || ""}`.trim(), subject: t.subject, kind: t.kind,
+          unread: msgs.some((m) => !m.read && m.sender_role !== role),
+          messages: msgs.map((m) => ({ from: m.sender_role === "vendor" ? "vendor" : "me", text: m.body, time: m.created_at })),
+        });
+      }
+      return out;
+    }
+    const db = getDb();
+    const threads = (db.threads || []).filter((t) => role === "vendor" ? t.vendorId === vendorId : t.customerId === userId);
+    return threads.map((t) => {
+      const msgs = (db.threadMessages || []).filter((m) => m.threadId === t.id);
+      const vendor = (db.vendors || []).find((v) => v.id === t.vendorId);
+      const customer = (db.users || []).find((u) => u.id === t.customerId);
+      return {
+        id: "th" + t.id, vendorId: t.vendorId, vendorName: vendor?.name || "Vendor",
+        customerName: customer ? `${customer.firstName || ""} ${customer.lastName || ""}`.trim() : "Customer",
+        subject: t.subject, kind: t.kind,
+        unread: msgs.some((m) => !m.read && m.senderRole !== role),
+        messages: msgs.map((m) => ({ from: m.senderRole === "vendor" ? "vendor" : "me", text: m.body, time: m.createdAt })),
+      };
+    }).sort((a, b) => b.id.localeCompare(a.id));
+  },
+
+  async markThreadRead(threadId, role) {
+    if (usingPg) {
+      await query(`UPDATE thread_messages SET read=true WHERE thread_id=$1 AND sender_role != $2`, [threadId, role]);
+      return;
+    }
+    const db = getDb();
+    (db.threadMessages || []).forEach((m) => { if (m.threadId === threadId && m.senderRole !== role) m.read = true; });
+    memSave();
+  },
+
+  // ── bookings (free — no payment, confirmed immediately) ──────────────────
+
+  async createBooking({ vendorId, customerId, customerName, eventDate, guests, location }) {
+    if (usingPg) {
+      const r = await query(
+        `INSERT INTO bookings (vendor_id, customer_id, customer_name, event_date, guests, location, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'confirmed') RETURNING *`,
+        [vendorId, customerId, customerName || "", eventDate || null, guests || null, location || ""]);
+      return r.rows[0];
+    }
+    const db = getDb();
+    db.bookings = db.bookings || [];
+    const b = { id: nextId("booking"), vendorId, customerId, customerName: customerName || "", eventDate: eventDate || null, guests: guests || null, location: location || "", status: "confirmed", createdAt: new Date().toISOString() };
+    db.bookings.push(b); memSave(); return b;
+  },
+
+  async listBookingsForVendor(vendorId) {
+    if (usingPg) {
+      const r = await query(`SELECT * FROM bookings WHERE vendor_id=$1 ORDER BY event_date ASC NULLS LAST, created_at DESC`, [vendorId]);
+      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, customerName: b.customer_name, date: b.event_date, guests: b.guests, location: b.location, status: b.status }));
+    }
+    const db = getDb();
+    return (db.bookings || []).filter((b) => b.vendorId === vendorId)
+      .map((b) => ({ id: "bk" + b.id, vendorId: b.vendorId, customerName: b.customerName, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }));
+  },
+
+  async listBookingsForCustomer(customerId) {
+    if (usingPg) {
+      const r = await query(
+        `SELECT b.*, v.name AS vendor_name FROM bookings b JOIN vendors v ON v.id = b.vendor_id WHERE b.customer_id=$1 ORDER BY b.event_date ASC NULLS LAST`, [customerId]);
+      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, vendorName: b.vendor_name, date: b.event_date, guests: b.guests, location: b.location, status: b.status }));
+    }
+    const db = getDb();
+    return (db.bookings || []).filter((b) => b.customerId === customerId)
+      .map((b) => { const v = (db.vendors || []).find((x) => x.id === b.vendorId); return { id: "bk" + b.id, vendorId: b.vendorId, vendorName: v?.name, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }; });
+  },
 };
