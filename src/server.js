@@ -1,0 +1,426 @@
+import express from "express";
+import cors from "cors";
+import { repo } from "./repo.js";
+import { query, usingPg } from "./db.js";
+import { ensureSeeded } from "./seed.js";
+import { CATEGORIES, LICENSE_BY_OFFERING, CUISINE_OPTIONS } from "./taxonomy.js";
+import { hashPassword, checkPassword, signToken, publicUser, requireAuth, requireVendor, requireAdmin } from "./auth.js";
+import { countries, statesOf, citiesOf, source as geoSource } from "./locations.js";
+import { billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } from "./billing.js";
+import { mountFeatures } from "./features.js";
+import { mountMedia } from "./media.js";
+import { mountCompliance } from "./compliance.js";
+import { mountChat } from "./chat.js";
+import { mountAnalytics } from "./analytics.js";
+import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
+import { sendVerifyEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
+
+const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
+
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+app.use(cors({ origin: (process.env.CORS_ORIGIN || "*").split(","), credentials: true }));
+
+// ── baseline security headers ───────────────────────────────────────────────
+// Lightweight, dependency-free defense-in-depth. The frontend (served by
+// Netlify) carries its own header set in netlify.toml — these cover the API.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "geolocation=(), camera=(), microphone=()");
+  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  next();
+});
+
+// ── global baseline rate limit ──────────────────────────────────────────────
+// Generous per-IP-per-path ceiling so no single endpoint can be hammered or
+// scraped. Sensitive routes (signup/login/contact) layer a stricter limit
+// on top of this — see their individual rateLimit(...) calls below.
+app.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
+
+const auth = requireAuth(repo);
+const admin = requireAdmin(repo);
+const COUNTRY_NAME = { US: "United States", CA: "Canada", NG: "Nigeria" };
+// Signup sends the full country name ("United States"); every other vendor
+// record (seed data, demo signups) stores the 2-letter code ("US"). Convert
+// here so a backend-created vendor's country always matches that convention
+// — otherwise it silently fails every country-based filter downstream.
+const codeForCountryName = (name) => Object.entries(COUNTRY_NAME).find(([, n]) => n === name)?.[0] || (name || "US");
+
+// limit a services object to max 3 offerings per category, keeping only valid offerings
+function sanitizeServices(services) {
+  const out = {};
+  if (!services || typeof services !== "object") return out;
+  for (const cat of CATEGORIES) {
+    const picked = Array.isArray(services[cat.id]) ? services[cat.id] : [];
+    const valid = picked.filter((o) => cat.offerings.includes(o)).slice(0, 3);
+    if (valid.length) out[cat.id] = valid;
+  }
+  return out;
+}
+
+// async error wrapper so handlers can throw/await safely
+const h = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: "Server error." }); });
+
+/* ── health & taxonomy ─────────────────────────────────────────────────── */
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
+
+/* ── locations ─────────────────────────────────────────────────────────── */
+app.get("/api/locations/countries", (req, res) => res.json(countries()));
+app.get("/api/locations/states", (req, res) => res.json(statesOf(req.query.country || "")));
+app.get("/api/locations/cities", (req, res) => res.json(citiesOf(req.query.country || "", req.query.state || "")));
+app.get("/api/locations/meta", (req, res) => res.json({ source: geoSource(), countryCount: countries().length }));
+
+// ── Public landing-page stats — used by the hero stats row. No auth needed. ──
+app.get("/api/stats/summary", h(async (req, res) => {
+  const vendors = await repo.listActiveVendors().catch(() => []);
+  const countrySet = new Set(vendors.map((v) => v.country).filter(Boolean));
+  res.json({
+    vendors: vendors.length,
+    categories: 7,
+    countries: Math.max(countrySet.size, 2), // US + Canada minimum, even pre-launch
+  });
+}));
+
+/* ── auth ──────────────────────────────────────────────────────────────── */
+const rl = new Map();
+function rateLimit({ windowMs, max }) {
+  return (req, res, next) => {
+    const key = (req.ip || req.headers["x-forwarded-for"] || "anon") + ":" + req.path;
+    const now = Date.now();
+    const rec = rl.get(key) || { count: 0, reset: now + windowMs };
+    if (now > rec.reset) { rec.count = 0; rec.reset = now + windowMs; }
+    rec.count++; rl.set(key, rec);
+    if (rec.count > max) return res.status(429).json({ error: "Too many attempts. Please try again later." });
+    next();
+  };
+}
+
+// Optional CAPTCHA verification (Cloudflare Turnstile / hCaptcha / reCAPTCHA).
+async function verifyCaptcha(token) {
+  if (!process.env.CAPTCHA_SECRET) return true; // not configured → skip (dev/demo)
+  if (!token) return false;
+  try {
+    const r = await fetch(process.env.CAPTCHA_VERIFY_URL || "https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ secret: process.env.CAPTCHA_SECRET, response: token }),
+    });
+    return !!(await r.json()).success;
+  } catch (e) { return false; }
+}
+
+app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(async (req, res) => {
+  const b = req.body || {};
+  if (b.hp) return res.status(400).json({ error: "Bot detected." });               // honeypot
+  if (!(await verifyCaptcha(b.captchaToken))) return res.status(400).json({ error: "Human verification failed. Please try again." });
+  const email = (b.email || "").trim().toLowerCase();
+  if (!email || !b.password) return res.status(400).json({ error: "Email and password are required." });
+  if (await repo.findUserByEmail(email)) return res.status(409).json({ error: "An account with this email already exists." });
+
+  const role = b.role === "vendor" ? "vendor" : "customer";
+  const emailToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const services = role === "vendor" ? sanitizeServices(b.services) : {};
+
+  const user = await repo.createUser({
+    role, email, passwordHash: hashPassword(b.password), verified: false, emailToken,
+    firstName: (b.firstName || email.split("@")[0]).trim(), lastName: (b.lastName || "").trim(),
+    phone: b.phone || "", address1: b.address1 || "", address2: b.address2 || "",
+    city: b.city || "", state: b.state || "", postal: b.postal || "", country: codeForCountryName(b.country),
+    businessName: b.businessName || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
+    services,
+  });
+
+  // Store legal acceptance for compliance record-keeping.
+  await repo.saveUserCompliance(user.id, {
+    termsAcceptedAt: b.termsAcceptedAt || new Date().toISOString(),
+    termsVersion: b.termsVersion || "1.0",
+    contractorAck: role === "vendor" ? !!b.contractorAck : false,
+    joinedAt: b.joinedAt || new Date().toISOString(),
+  }).catch(() => {});
+
+  if (role === "vendor") {
+    const firstCat = Object.keys(services)[0];
+    const firstOffering = firstCat ? services[firstCat][0] : "";
+    const FOUNDING_VENDOR_LIMIT = 100;
+    const vendorCountBeforeThisOne = await repo.countVendors().catch(() => FOUNDING_VENDOR_LIMIT); // if the count fails for any reason, default to NOT granting — safer than over-granting
+    const newVendor = await repo.createVendor({
+      ownerUserId: user.id, name: (b.businessName || `${user.firstName}'s Services`).trim(),
+      cat: firstCat || "mgmt", offering: firstOffering || "Full event planning",
+      price: 2, startingPrice: b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null),
+      city: user.city, region: user.state, country: user.country || "US",
+      licensed: !!b.licensed, fullService: true,
+      languages: Array.isArray(b.languagesSpoken) && b.languagesSpoken.length ? b.languagesSpoken : ["English"],
+      about: b.pitch || "", pitch: b.pitch || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
+      cuisines: b.cuisines && b.cuisines.length ? b.cuisines : null, services, hue: 200,
+      experienceSinceYear: b.experienceSinceYear ?? null,
+      serviceAreas: Array.isArray(b.serviceAreas) ? b.serviceAreas : [],
+    });
+    // Founding-vendor perk: first 100 real signups get Premium, free, no expiry.
+    // Isolated from vendor creation itself — if this fails (e.g. schema_v8.sql
+    // not run yet), the vendor account still exists; they just don't get the
+    // badge until an admin grants it manually or the schema catches up.
+    if (vendorCountBeforeThisOne < FOUNDING_VENDOR_LIMIT && newVendor?.id) {
+      await repo.setPremium(newVendor.id, "founding", null).catch(() => {});
+    }
+  }
+  // Send a registration confirmation / verification email with an activation link.
+  // No-throw: a mail failure never blocks signup.
+  const verifyLink = `${APP_URL}/?verify=${emailToken}`;
+  sendVerifyEmail(email, verifyLink).catch(() => {});
+  res.status(201).json({ token: signToken(user), user: publicUser(user) });
+}));
+
+app.get("/api/auth/verify", h(async (req, res) => {
+  const ok = await repo.verifyEmail(req.query.token);
+  if (!ok) return res.status(400).json({ error: "Invalid or expired verification link." });
+  res.json({ ok: true, verified: true });
+}));
+
+// Contact form (public, rate-limited) → emails the team inbox.
+app.post("/api/contact", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(async (req, res) => {
+  const b = req.body || {};
+  if (b.hp) return res.json({ ok: true });
+  if (!b.subject || !b.body) return res.status(400).json({ error: "Subject and message are required." });
+  sendContactEmail({ name: b.name, email: b.email, subject: b.subject, body: b.body }).catch(() => {});
+  res.json({ ok: true });
+}));
+
+app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }), h(async (req, res) => {
+  const email = (req.body?.email || "").trim().toLowerCase();
+  const user = await repo.findUserByEmail(email);
+  if (!user || !checkPassword(req.body?.password || "", user.passwordHash))
+    return res.status(401).json({ error: "Invalid email or password." });
+  if (user.suspended) return res.status(403).json({ error: "This account has been suspended." });
+  res.json({ token: signToken(user), user: publicUser(user) });
+}));
+
+app.get("/api/auth/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
+
+/* ── account settings (customers & vendors) ────────────────────────────── */
+app.get("/api/account", auth, (req, res) => res.json(publicUser(req.user)));
+
+app.put("/api/account", auth, h(async (req, res) => {
+  const b = req.body || {};
+  const patch = {};
+  for (const k of ["firstName", "lastName", "email", "phone", "address1", "address2", "city", "state", "postal", "country", "businessName", "businessAddress", "businessPhone"])
+    if (b[k] !== undefined) patch[k] = String(b[k]);
+  if (b.prefs !== undefined && typeof b.prefs === "object") patch.prefs = b.prefs;
+  if (patch.email) {
+    const existing = await repo.findUserByEmail(patch.email.trim().toLowerCase());
+    if (existing && String(existing.id) !== String(req.user.id)) return res.status(409).json({ error: "That email is already in use." });
+    patch.email = patch.email.trim().toLowerCase();
+  }
+  const updated = await repo.updateUser(req.user.id, patch);
+  res.json(publicUser(updated));
+}));
+
+app.post("/api/account/password", auth, h(async (req, res) => {
+  const { current, next } = req.body || {};
+  if (!checkPassword(current || "", req.user.passwordHash)) return res.status(400).json({ error: "Current password is incorrect." });
+  if (!next || next.length < 8) return res.status(400).json({ error: "New password must be at least 8 characters." });
+  await repo.setPassword(req.user.id, hashPassword(next));
+  res.json({ ok: true });
+}));
+
+app.delete("/api/account", auth, h(async (req, res) => {
+  await repo.deleteUser(req.user.id);
+  res.json({ ok: true });
+}));
+
+/* ── vendors (search) ──────────────────────────────────────────────────── */
+app.get("/api/vendors", h(async (req, res) => {
+  const { q, category, offering, country, verified, licensed, sort } = req.query;
+  let list = await repo.listActiveVendors();
+  if (category) list = list.filter((v) => v.cat === category);
+  if (offering) list = list.filter((v) => v.offering === offering);
+  if (country && country !== "all") list = list.filter((v) => v.country === country || COUNTRY_NAME[v.country] === country);
+  if (verified === "true") list = list.filter((v) => v.verified);
+  if (licensed === "true") list = list.filter((v) => !LICENSE_BY_OFFERING[v.offering] || v.licensed);
+  if (q) {
+    const s = String(q).toLowerCase();
+    list = list.filter((v) => v.name.toLowerCase().includes(s) || (v.offering || "").toLowerCase().includes(s) || (v.cuisines && v.cuisines.some((c) => c.toLowerCase().includes(s))));
+  }
+  const sorters = {
+    rating: (a, b) => b.rating - a.rating,
+    priceLow: (a, b) => a.startingPrice - b.startingPrice,
+    priceHigh: (a, b) => b.startingPrice - a.startingPrice,
+    distance: (a, b) => a.distance - b.distance,
+    featured: (a, b) => (b.sponsored - a.sponsored) || (b.premium - a.premium) || b.rating - a.rating,
+  };
+  res.json([...list].sort(sorters[sort] || sorters.featured));
+}));
+
+app.get("/api/vendors/:id", h(async (req, res) => {
+  const v = await repo.findVendorById(req.params.id);
+  if (!v) return res.status(404).json({ error: "Vendor not found" });
+  res.json(v);
+}));
+
+/* ── quotes ────────────────────────────────────────────────────────────── */
+app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
+  const b = req.body || {};
+  if (!b.vendorId) return res.status(400).json({ error: "vendorId is required." });
+  const id = await repo.createQuote(b);
+  res.status(201).json({ ok: true, id });
+}));
+
+/* ── vendor's own listing (auth) ───────────────────────────────────────── */
+app.get("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
+  res.json(await repo.findVendorByOwner(req.user.id));
+}));
+
+app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
+  const b = req.body || {};
+  const cur = (await repo.findVendorByOwner(req.user.id)) || { maxPhotos: 3, plan: "free", languages: ["English"] };
+  const patch = {};
+  if (b.services !== undefined) patch.services = sanitizeServices(b.services);
+  if (b.cuisines !== undefined) patch.cuisines = Array.isArray(b.cuisines) ? b.cuisines : null;
+  if (b.licensed !== undefined) patch.licensed = !!b.licensed;
+  if (b.languagesSpoken !== undefined) patch.languages = Array.isArray(b.languagesSpoken) ? b.languagesSpoken : cur.languages;
+  if (b.blockedDates !== undefined) patch.blockedDates = Array.isArray(b.blockedDates) ? b.blockedDates : [];
+  if (b.name) patch.name = b.name;
+  if (b.about !== undefined) patch.about = b.about;
+  if (b.experienceSinceYear !== undefined) patch.experienceSinceYear = b.experienceSinceYear;
+  if (b.serviceAreas !== undefined) patch.serviceAreas = Array.isArray(b.serviceAreas) ? b.serviceAreas : [];
+  if (b.startingPrice !== undefined) patch.startingPrice = b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null);
+  // Event Vendors is free — every listing gets the full photo allowance.
+  const maxPhotos = 20;
+  if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);
+  const listing = await repo.updateVendorByOwner(req.user.id, patch, { name: `${req.user.firstName}'s Services`, services: req.user.services || {} });
+  res.json(listing);
+}));
+
+/* ── messaging — two-sided: customer ⇄ vendor, one thread per pair ──────── */
+app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
+  const { vendorId, subject, body, kind } = req.body || {};
+  if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
+  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind });
+  await repo.addThreadMessage(thread.id, "customer", body);
+  res.status(201).json({ ok: true, threadId: "th" + thread.id });
+}));
+
+app.get("/api/threads", auth, h(async (req, res) => {
+  if (req.user.role === "vendor") {
+    const listing = await repo.findVendorByOwner(req.user.id);
+    if (!listing) return res.json([]);
+    return res.json(await repo.listThreadsFor({ role: "vendor", vendorId: listing.id }));
+  }
+  res.json(await repo.listThreadsFor({ role: "customer", userId: req.user.id }));
+}));
+
+app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
+  const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
+  const { body } = req.body || {};
+  if (!body) return res.status(400).json({ error: "body is required." });
+  await repo.addThreadMessage(threadId, req.user.role === "vendor" ? "vendor" : "customer", body);
+  res.status(201).json({ ok: true });
+}));
+
+/* ── bookings — free, confirmed immediately, no payment involved ────────── */
+app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
+  const { vendorId, date, guests, location } = req.body || {};
+  if (!vendorId) return res.status(400).json({ error: "vendorId is required." });
+  const customerName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Customer";
+  const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, eventDate: date || null, guests: guests || null, location: location || "" });
+  // Drop a thread message too, so the booking shows up in the vendor's inbox as well as their bookings list.
+  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking confirmed", kind: "booking" }).catch(() => null);
+  if (thread) await repo.addThreadMessage(thread.id, "customer", `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`).catch(() => {});
+  res.status(201).json({ ok: true, id: "bk" + booking.id });
+}));
+
+app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.json([]);
+  res.json(await repo.listBookingsForVendor(listing.id));
+}));
+
+app.get("/api/bookings", auth, h(async (req, res) => res.json(await repo.listBookingsForCustomer(req.user.id))));
+
+/* ── premium tiers — founding spots now, paid monthly/yearly later ──────── */
+app.get("/api/premium/stats", h(async (req, res) => {
+  const founding = await repo.countFoundingVendors().catch(() => 0);
+  res.json({ foundingUsed: founding, foundingLimit: 100, foundingRemaining: Math.max(0, 100 - founding) });
+}));
+
+// Admin-only for now — this is where a Stripe webhook will call setPremium()
+// automatically once monthly/yearly billing goes live. Until then, an admin
+// can grant or revoke Premium by hand (e.g. for partnerships, corrections).
+app.post("/api/admin/set-premium", auth, admin, h(async (req, res) => {
+  const { vendorId, tier, months } = req.body || {};
+  if (!vendorId) return res.status(400).json({ error: "vendorId is required." });
+  let expiresAt = null;
+  if (tier === "monthly") expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  else if (tier === "yearly") expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+  else if (months) expiresAt = new Date(Date.now() + months * 30 * 24 * 60 * 60 * 1000).toISOString();
+  // tier === null/undefined clears premium status entirely (manual revoke)
+  await repo.setPremium(vendorId, tier || null, tier ? expiresAt : null);
+  res.json({ ok: true, tier: tier || null, expiresAt: tier ? expiresAt : null });
+}));
+
+/* ── billing ── DORMANT ─────────────────────────────────────────────────────
+   Event Vendors is 100% free. Subscriptions & payments are intentionally
+   disabled. billing.js / payments.js remain in the repo but are not wired to
+   any active route. To re-enable paid tiers later, restore the handlers and
+   configure Stripe keys.                                                       */
+app.get("/api/billing/mode", (req, res) => res.json({ mode: "disabled" }));
+app.post("/api/billing/subscribe", (req, res) => res.status(410).json({ error: "Subscriptions are disabled — Event Vendors is free." }));
+app.post("/api/payments/checkout", (req, res) => res.status(410).json({ error: "Payments are disabled — Event Vendors is free." }));
+app.post("/api/billing/webhook", (req, res) => res.status(410).json({ error: "Billing is disabled." }));
+
+/* ── community reports + admin moderation ──────────────────────────────── */
+app.post("/api/reports", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(async (req, res) => {
+  const b = req.body || {};
+  if (!b.vendorId && !b.userId) return res.status(400).json({ error: "vendorId or userId is required." });
+  const id = await repo.createReport({ vendorId: b.vendorId, userId: b.userId, reason: (b.reason || "").slice(0, 1000), reasons: Array.isArray(b.reasons) ? b.reasons.slice(0, 12) : [], reporterEmail: b.reporterEmail || "" });
+  // Notify the admin team immediately — reports should never sit unseen in the database.
+  sendReportNotificationEmail({ vendorId: b.vendorId, userId: b.userId, reasons: b.reasons, reason: b.reason, reporterEmail: b.reporterEmail }).catch((e) => console.error("[reports] notification email failed:", e.message));
+  res.status(201).json({ ok: true, id });
+}));
+
+app.get("/api/admin/reports", admin, h(async (req, res) => res.json(await repo.listReports(req.query.status))));
+app.get("/api/admin/users", admin, h(async (req, res) => res.json((await repo.listUsers()).map(publicUser))));
+
+app.post("/api/admin/users/:id/suspend", admin, h(async (req, res) => {
+  const val = req.body?.suspended === undefined ? true : !!req.body.suspended;
+  const out = await repo.setUserSuspended(req.params.id, val);
+  if (out === null) return res.status(404).json({ error: "User not found." });
+  res.json({ ok: true, id: Number(req.params.id), suspended: val });
+}));
+
+app.delete("/api/admin/users/:id", admin, h(async (req, res) => {
+  const ids = await repo.deleteUser(req.params.id);
+  if (ids === null) return res.status(404).json({ error: "User not found." });
+  res.json({ ok: true, deletedUserId: Number(req.params.id), deletedVendorIds: ids });
+}));
+
+app.delete("/api/admin/vendors/:id", admin, h(async (req, res) => {
+  const ok = await repo.deleteVendor(req.params.id);
+  if (!ok) return res.status(404).json({ error: "Vendor not found." });
+  res.json({ ok: true, deletedVendorId: req.params.id });
+}));
+
+/* ── new feature endpoints (reviews, bookings, notifications, messaging, password reset) ── */
+mountFeatures(app, { auth, requireVendor, repo });
+// To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
+mountMedia(app, { auth, requireVendor, repo });
+mountCompliance(app, {
+  auth, requireVendor, repo,
+  sendEmail: async ({ to, subject, html }) => {
+    const { send } = await import("./email.js").catch(() => ({}));
+    if (send) return send({ to, subject, html });
+  },
+  sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
+});
+mountChat(app, { rateLimit });
+mountAnalytics(app, { rateLimit, query, usingPg, admin });
+//   await mountPayments(app, { auth, requireVendor });
+
+/* ── boot ──────────────────────────────────────────────────────────────── */
+const PORT = process.env.PORT || 4000;
+(async () => {
+  await repo.init();
+  await ensureSeeded();
+  app.listen(PORT, () => console.log(`Event Vendors API running on http://localhost:${PORT}`));
+})().catch((e) => { console.error("Failed to start:", e); process.exit(1); });
