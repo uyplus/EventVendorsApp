@@ -143,7 +143,9 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
   if (role === "vendor") {
     const firstCat = Object.keys(services)[0];
     const firstOffering = firstCat ? services[firstCat][0] : "";
-    await repo.createVendor({
+    const FOUNDING_VENDOR_LIMIT = 100;
+    const vendorCountBeforeThisOne = await repo.countVendors().catch(() => FOUNDING_VENDOR_LIMIT); // if the count fails for any reason, default to NOT granting — safer than over-granting
+    const newVendor = await repo.createVendor({
       ownerUserId: user.id, name: (b.businessName || `${user.firstName}'s Services`).trim(),
       cat: firstCat || "mgmt", offering: firstOffering || "Full event planning",
       price: 2, startingPrice: b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null),
@@ -155,6 +157,13 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       experienceSinceYear: b.experienceSinceYear ?? null,
       serviceAreas: Array.isArray(b.serviceAreas) ? b.serviceAreas : [],
     });
+    // Founding-vendor perk: first 100 real signups get Premium, free, no expiry.
+    // Isolated from vendor creation itself — if this fails (e.g. schema_v8.sql
+    // not run yet), the vendor account still exists; they just don't get the
+    // badge until an admin grants it manually or the schema catches up.
+    if (vendorCountBeforeThisOne < FOUNDING_VENDOR_LIMIT && newVendor?.id) {
+      await repo.setPremium(newVendor.id, "founding", null).catch(() => {});
+    }
   }
   // Send a registration confirmation / verification email with an activation link.
   // No-throw: a mail failure never blocks signup.
@@ -328,6 +337,27 @@ app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
 }));
 
 app.get("/api/bookings", auth, h(async (req, res) => res.json(await repo.listBookingsForCustomer(req.user.id))));
+
+/* ── premium tiers — founding spots now, paid monthly/yearly later ──────── */
+app.get("/api/premium/stats", h(async (req, res) => {
+  const founding = await repo.countFoundingVendors().catch(() => 0);
+  res.json({ foundingUsed: founding, foundingLimit: 100, foundingRemaining: Math.max(0, 100 - founding) });
+}));
+
+// Admin-only for now — this is where a Stripe webhook will call setPremium()
+// automatically once monthly/yearly billing goes live. Until then, an admin
+// can grant or revoke Premium by hand (e.g. for partnerships, corrections).
+app.post("/api/admin/set-premium", auth, admin, h(async (req, res) => {
+  const { vendorId, tier, months } = req.body || {};
+  if (!vendorId) return res.status(400).json({ error: "vendorId is required." });
+  let expiresAt = null;
+  if (tier === "monthly") expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  else if (tier === "yearly") expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+  else if (months) expiresAt = new Date(Date.now() + months * 30 * 24 * 60 * 60 * 1000).toISOString();
+  // tier === null/undefined clears premium status entirely (manual revoke)
+  await repo.setPremium(vendorId, tier || null, tier ? expiresAt : null);
+  res.json({ ok: true, tier: tier || null, expiresAt: tier ? expiresAt : null });
+}));
 
 /* ── billing ── DORMANT ─────────────────────────────────────────────────────
    Event Vendors is 100% free. Subscriptions & payments are intentionally

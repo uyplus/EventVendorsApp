@@ -20,6 +20,14 @@ const toVendor = (r) => r && ({
   name: r.name, cat: r.cat, offering: r.offering, price: r.price, startingPrice: r.starting_price,
   city: r.city, region: r.region, country: r.country, distance: r.distance,
   rating: Number(r.rating), reviews: r.reviews, premium: r.premium, sponsored: r.sponsored,
+  premiumTier: r.premium_tier || null,
+  premiumSince: r.premium_since || null,
+  premiumExpiresAt: r.premium_expires_at || null,
+  // The badge is never a stored boolean that can go stale — it's computed
+  // live from tier + expiry every time a vendor record is read. A 'founding'
+  // tier has no expiry; monthly/yearly tiers stop counting the instant
+  // premium_expires_at passes, with nothing to clean up afterward.
+  isPremiumActive: !!r.premium_tier && (!r.premium_expires_at || new Date(r.premium_expires_at) > new Date()),
   verified: r.verified, suspended: r.suspended, plan: r.plan, licensed: r.licensed,
   licenceStatus: r.licence_status || (r.licensed ? "pending" : "none"),
   licencePath: r.licence_path, licenceExpires: r.licence_expires,
@@ -149,6 +157,55 @@ export const repo = {
     if (!u) return false; u.passwordHash = hash; memSave(); return true;
   },
 
+  /* ── premium tiers (founding spots now; paid monthly/yearly later) ────── */
+
+  async countVendors() {
+    if (usingPg) return parseInt((await query("SELECT COUNT(*)::int AS n FROM vendors")).rows[0].n, 10);
+    return getDb().vendors.length;
+  },
+
+  // tier: 'founding' | 'monthly' | 'yearly' | null (null clears premium status)
+  // expiresAt: a Date/ISO string, or null for tiers that never expire (founding)
+  async setPremium(vendorId, tier, expiresAt = null) {
+    if (usingPg) {
+      try {
+        await query(
+          `UPDATE vendors SET premium_tier=$2, premium_since=now(), premium_expires_at=$3 WHERE id=$1`,
+          [vendorId, tier, expiresAt]);
+        return true;
+      } catch (e) {
+        if (!/column .* does not exist/i.test(e.message)) throw e;
+        console.error("[repo] setPremium: premium columns missing — run schema_v8.sql in Supabase. Skipping (signup itself still succeeded). Detail:", e.message);
+        return false;
+      }
+    }
+    const v = getDb().vendors.find((x) => String(x.id) === String(vendorId));
+    if (!v) return false;
+    v.premiumTier = tier; v.premiumSince = new Date().toISOString(); v.premiumExpiresAt = expiresAt;
+    v.isPremiumActive = !!tier && (!expiresAt || new Date(expiresAt) > new Date());
+    memSave(); return true;
+  },
+
+  async countActivePremium() {
+    if (usingPg) {
+      try {
+        const r = await query(`SELECT COUNT(*)::int AS n FROM vendors WHERE premium_tier IS NOT NULL AND (premium_expires_at IS NULL OR premium_expires_at > now())`);
+        return parseInt(r.rows[0].n, 10);
+      } catch (e) { return 0; }
+    }
+    return getDb().vendors.filter((v) => v.isPremiumActive).length;
+  },
+
+  async countFoundingVendors() {
+    if (usingPg) {
+      try {
+        const r = await query(`SELECT COUNT(*)::int AS n FROM vendors WHERE premium_tier = 'founding'`);
+        return parseInt(r.rows[0].n, 10);
+      } catch (e) { return 0; }
+    }
+    return getDb().vendors.filter((v) => v.premiumTier === "founding").length;
+  },
+
   /* ── vendors ────────────────────────────────────────────────────────── */
   async createVendor(v) {
     if (usingPg) {
@@ -210,8 +267,21 @@ export const repo = {
   },
 
   async listActiveVendors() {
-    if (usingPg) return (await query("SELECT * FROM vendors WHERE suspended=FALSE")).rows.map(toVendor);
-    return getDb().vendors.filter((v) => v.id && !v.suspended);
+    if (usingPg) {
+      try {
+        const r = await query(
+          `SELECT *, (premium_tier IS NOT NULL AND (premium_expires_at IS NULL OR premium_expires_at > now())) AS is_premium_active
+           FROM vendors WHERE suspended=FALSE
+           ORDER BY is_premium_active DESC, rating DESC NULLS LAST`);
+        return r.rows.map(toVendor);
+      } catch (e) {
+        if (!/column .* does not exist/i.test(e.message)) throw e;
+        // schema_v8.sql not run yet — premium sorting just isn't active, everything else still works.
+        return (await query("SELECT * FROM vendors WHERE suspended=FALSE")).rows.map(toVendor);
+      }
+    }
+    return getDb().vendors.filter((v) => v.id && !v.suspended)
+      .sort((a, b) => ((b.isPremiumActive ? 1 : 0) - (a.isPremiumActive ? 1 : 0)) || ((b.rating || 0) - (a.rating || 0)));
   },
 
   // patch contains only the keys to change; cuisines:null clears cuisines.
