@@ -294,12 +294,14 @@ export const repo = {
         const r = await query(
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
-             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16 WHERE id=$1 RETURNING *`,
+             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
+             equipment_hire=$17, full_service=$18 WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
            !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
            merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
-           merged.startingPrice === undefined ? null : merged.startingPrice]);
+           merged.startingPrice === undefined ? null : merged.startingPrice,
+           !!merged.equipmentHire, !!merged.fullService]);
         return toVendor(r.rows[0]);
       } catch (e) {
         if (!/column .* does not exist/i.test(e.message)) throw e;
@@ -548,5 +550,20 @@ export const repo = {
     const db = getDb();
     return (db.bookings || []).filter((b) => b.customerId === customerId)
       .map((b) => { const v = (db.vendors || []).find((x) => x.id === b.vendorId); return { id: "bk" + b.id, vendorId: b.vendorId, vendorName: v?.name, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }; });
+  },
+
+  // Cancelling sets status rather than deleting — keeps a record, and frees
+  // the customer to immediately book a new date with the same or another
+  // vendor. Verifies the booking actually belongs to this customer first.
+  async cancelBooking(bookingId, customerId) {
+    const rawId = String(bookingId).replace(/^bk/, "");
+    if (usingPg) {
+      const r = await query(`UPDATE bookings SET status='cancelled' WHERE id=$1 AND customer_id=$2 RETURNING id`, [rawId, customerId]);
+      return r.rowCount > 0;
+    }
+    const db = getDb();
+    const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && x.customerId === customerId);
+    if (!b) return false;
+    b.status = "cancelled"; memSave(); return true;
   },
 };

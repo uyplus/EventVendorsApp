@@ -150,7 +150,7 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       cat: firstCat || "mgmt", offering: firstOffering || "Full event planning",
       price: 2, startingPrice: b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null),
       city: user.city, region: user.state, country: user.country || "US",
-      licensed: !!b.licensed, fullService: true,
+      licensed: !!b.licensed, equipmentHire: !!b.equipmentHire, fullService: !!b.fullService,
       languages: Array.isArray(b.languagesSpoken) && b.languagesSpoken.length ? b.languagesSpoken : ["English"],
       about: b.pitch || "", pitch: b.pitch || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
       cuisines: b.cuisines && b.cuisines.length ? b.cuisines : null, services, hue: 200,
@@ -285,6 +285,8 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.experienceSinceYear !== undefined) patch.experienceSinceYear = b.experienceSinceYear;
   if (b.serviceAreas !== undefined) patch.serviceAreas = Array.isArray(b.serviceAreas) ? b.serviceAreas : [];
   if (b.startingPrice !== undefined) patch.startingPrice = b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null);
+  if (b.equipmentHire !== undefined) patch.equipmentHire = !!b.equipmentHire;
+  if (b.fullService !== undefined) patch.fullService = !!b.fullService;
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);
@@ -337,6 +339,12 @@ app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
 }));
 
 app.get("/api/bookings", auth, h(async (req, res) => res.json(await repo.listBookingsForCustomer(req.user.id))));
+
+app.post("/api/bookings/:id/cancel", auth, h(async (req, res) => {
+  const ok = await repo.cancelBooking(req.params.id, req.user.id);
+  if (!ok) return res.status(404).json({ error: "Booking not found, or it doesn't belong to you." });
+  res.json({ ok: true });
+}));
 
 /* ── premium tiers — founding spots now, paid monthly/yearly later ──────── */
 app.get("/api/premium/stats", h(async (req, res) => {
