@@ -258,6 +258,20 @@ app.get("/api/vendors/:id", h(async (req, res) => {
   res.json(v);
 }));
 
+app.get("/api/vendors/:id/reviews", h(async (req, res) => res.json(await repo.listReviewsForVendor(req.params.id))));
+
+app.get("/api/vendors/:id/response-time", h(async (req, res) => res.json(await repo.getVendorResponseStats(req.params.id))));
+
+app.post("/api/vendors/:id/reviews", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 10 }), h(async (req, res) => {
+  const { rating, text, author } = req.body || {};
+  const r = parseInt(rating);
+  if (!r || r < 1 || r > 5) return res.status(400).json({ error: "rating must be 1-5." });
+  const authorName = author || `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Guest";
+  const stats = await repo.createReview(req.params.id, req.user.id, authorName, r, (text || "").slice(0, 1000));
+  if (!stats) return res.status(503).json({ error: "Reviews aren't set up on the server yet." });
+  res.status(201).json({ ok: true, ...stats });
+}));
+
 /* ── quotes ────────────────────────────────────────────────────────────── */
 app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
   const b = req.body || {};

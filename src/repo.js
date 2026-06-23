@@ -206,6 +206,91 @@ export const repo = {
     return getDb().vendors.filter((v) => v.premiumTier === "founding").length;
   },
 
+  /* ── reviews — real, persisted; vendor rating/count recompute live ────── */
+
+  async createReview(vendorId, customerId, authorName, rating, body) {
+    if (usingPg) {
+      try {
+        await query(
+          `INSERT INTO reviews (vendor_id, customer_id, author_name, rating, body) VALUES ($1,$2,$3,$4,$5)`,
+          [vendorId, customerId || null, authorName || "Guest", rating, body || ""]);
+        // Recompute the vendor's aggregate rating/count from real reviews —
+        // this is what makes the counter genuinely live, not a frozen seed number.
+        const agg = await query(`SELECT COUNT(*)::int AS n, AVG(rating)::numeric(3,2) AS avg FROM reviews WHERE vendor_id=$1`, [vendorId]);
+        const { n, avg } = agg.rows[0];
+        await query(`UPDATE vendors SET reviews=$2, rating=$3 WHERE id=$1`, [vendorId, n, avg]);
+        return { count: n, rating: parseFloat(avg) };
+      } catch (e) {
+        if (!/relation .* does not exist/i.test(e.message) && !/column .* does not exist/i.test(e.message)) throw e;
+        console.error("[repo] createReview: reviews table missing — run schema_v9.sql in Supabase. Review was not saved. Detail:", e.message);
+        return null;
+      }
+    }
+    const db = getDb();
+    db.reviews = db.reviews || [];
+    db.reviews.push({ id: nextId("review"), vendorId, customerId: customerId || null, authorName: authorName || "Guest", rating, body: body || "", createdAt: new Date().toISOString() });
+    const mine = db.reviews.filter((r) => r.vendorId === vendorId);
+    const avg = mine.reduce((s, r) => s + r.rating, 0) / mine.length;
+    const v = db.vendors.find((x) => x.id === vendorId);
+    if (v) { v.reviews = mine.length; v.rating = Math.round(avg * 100) / 100; }
+    memSave();
+    return { count: mine.length, rating: Math.round(avg * 100) / 100 };
+  },
+
+  async listReviewsForVendor(vendorId) {
+    if (usingPg) {
+      try {
+        const r = await query(`SELECT * FROM reviews WHERE vendor_id=$1 ORDER BY created_at DESC`, [vendorId]);
+        return r.rows.map((x) => ({ author: x.author_name, rating: x.rating, text: x.body, date: new Date(x.created_at).toLocaleDateString() }));
+      } catch (e) { return []; }
+    }
+    const db = getDb();
+    return (db.reviews || []).filter((r) => r.vendorId === vendorId)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .map((r) => ({ author: r.authorName, rating: r.rating, text: r.body, date: new Date(r.createdAt).toLocaleDateString() }));
+  },
+
+  /* ── response time — computed from real message timestamps ────────────
+     For each thread, time from the customer's first message to the
+     vendor's first reply after it, averaged across all threads with a
+     reply. This is a genuine measurement, not an estimate or a default. */
+  async getVendorResponseStats(vendorId) {
+    if (usingPg) {
+      try {
+        const r = await query(`
+          WITH first_customer AS (
+            SELECT t.id AS thread_id, MIN(m.created_at) AS at
+            FROM threads t JOIN thread_messages m ON m.thread_id = t.id
+            WHERE t.vendor_id = $1 AND m.sender_role = 'customer'
+            GROUP BY t.id
+          ),
+          first_reply AS (
+            SELECT fc.thread_id, MIN(m.created_at) AS at
+            FROM first_customer fc
+            JOIN thread_messages m ON m.thread_id = fc.thread_id AND m.sender_role = 'vendor' AND m.created_at > fc.at
+            GROUP BY fc.thread_id
+          )
+          SELECT AVG(EXTRACT(EPOCH FROM (fr.at - fc.at)))::int AS avg_seconds, COUNT(*)::int AS n
+          FROM first_customer fc JOIN first_reply fr ON fr.thread_id = fc.thread_id`, [vendorId]);
+        const { avg_seconds, n } = r.rows[0];
+        return { avgMinutes: avg_seconds != null ? Math.round(avg_seconds / 60) : null, sampleSize: n || 0 };
+      } catch (e) { return { avgMinutes: null, sampleSize: 0 }; }
+    }
+    const db = getDb();
+    const myThreads = (db.threads || []).filter((t) => t.vendorId === Number(vendorId));
+    let total = 0, count = 0;
+    for (const t of myThreads) {
+      const msgs = (db.threadMessages || []).filter((m) => m.threadId === t.id).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+      const firstCustomer = msgs.find((m) => m.senderRole === "customer");
+      if (!firstCustomer) continue;
+      const reply = msgs.find((m) => m.senderRole === "vendor" && new Date(m.createdAt) > new Date(firstCustomer.createdAt));
+      if (!reply) continue;
+      total += (new Date(reply.createdAt) - new Date(firstCustomer.createdAt)) / 60000;
+      count++;
+    }
+    return { avgMinutes: count ? Math.round(total / count) : null, sampleSize: count };
+  },
+
   /* ── vendors ────────────────────────────────────────────────────────── */
   async createVendor(v) {
     if (usingPg) {
