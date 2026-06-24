@@ -20,6 +20,7 @@ const toVendor = (r) => r && ({
   name: r.name, cat: r.cat, offering: r.offering, price: r.price, startingPrice: r.starting_price,
   city: r.city, region: r.region, country: r.country, distance: r.distance,
   rating: Number(r.rating), reviews: r.reviews, premium: r.premium, sponsored: r.sponsored,
+  thumbsUp: r.thumbs_up || 0, thumbsDown: r.thumbs_down || 0,
   premiumTier: r.premium_tier || null,
   premiumSince: r.premium_since || null,
   premiumExpiresAt: r.premium_expires_at || null,
@@ -208,46 +209,50 @@ export const repo = {
 
   /* ── reviews — real, persisted; vendor rating/count recompute live ────── */
 
-  async createReview(vendorId, customerId, authorName, rating, body) {
+  async createReview(vendorId, customerId, authorName, rating, body, thumbs) {
     if (usingPg) {
       try {
         await query(
-          `INSERT INTO reviews (vendor_id, customer_id, author_name, rating, body) VALUES ($1,$2,$3,$4,$5)`,
-          [vendorId, customerId || null, authorName || "Guest", rating, body || ""]);
-        // Recompute the vendor's aggregate rating/count from real reviews —
-        // this is what makes the counter genuinely live, not a frozen seed number.
-        const agg = await query(`SELECT COUNT(*)::int AS n, AVG(rating)::numeric(3,2) AS avg FROM reviews WHERE vendor_id=$1`, [vendorId]);
-        const { n, avg } = agg.rows[0];
-        await query(`UPDATE vendors SET reviews=$2, rating=$3 WHERE id=$1`, [vendorId, n, avg]);
-        return { count: n, rating: parseFloat(avg) };
+          `INSERT INTO reviews (vendor_id, customer_id, author_name, rating, body, thumbs) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [vendorId, customerId || null, authorName || "Guest", rating, body || "", thumbs || null]);
+        // Recompute the vendor's aggregate rating/count/thumbs from real reviews —
+        // this is what makes the counters genuinely live, not frozen seed numbers.
+        const agg = await query(`SELECT COUNT(*)::int AS n, AVG(rating)::numeric(3,2) AS avg,
+          COUNT(*) FILTER (WHERE thumbs='up')::int AS up, COUNT(*) FILTER (WHERE thumbs='down')::int AS down
+          FROM reviews WHERE vendor_id=$1`, [vendorId]);
+        const { n, avg, up, down } = agg.rows[0];
+        await query(`UPDATE vendors SET reviews=$2, rating=$3, thumbs_up=$4, thumbs_down=$5 WHERE id=$1`, [vendorId, n, avg, up, down]);
+        return { count: n, rating: parseFloat(avg), thumbsUp: up, thumbsDown: down };
       } catch (e) {
         if (!/relation .* does not exist/i.test(e.message) && !/column .* does not exist/i.test(e.message)) throw e;
-        console.error("[repo] createReview: reviews table missing — run schema_v9.sql in Supabase. Review was not saved. Detail:", e.message);
+        console.error("[repo] createReview: reviews table/columns missing — run schema_v9.sql and schema_v10.sql in Supabase. Review was not saved. Detail:", e.message);
         return null;
       }
     }
     const db = getDb();
     db.reviews = db.reviews || [];
-    db.reviews.push({ id: nextId("review"), vendorId, customerId: customerId || null, authorName: authorName || "Guest", rating, body: body || "", createdAt: new Date().toISOString() });
+    db.reviews.push({ id: nextId("review"), vendorId, customerId: customerId || null, authorName: authorName || "Guest", rating, body: body || "", thumbs: thumbs || null, createdAt: new Date().toISOString() });
     const mine = db.reviews.filter((r) => r.vendorId === vendorId);
     const avg = mine.reduce((s, r) => s + r.rating, 0) / mine.length;
+    const up = mine.filter((r) => r.thumbs === "up").length;
+    const down = mine.filter((r) => r.thumbs === "down").length;
     const v = db.vendors.find((x) => x.id === vendorId);
-    if (v) { v.reviews = mine.length; v.rating = Math.round(avg * 100) / 100; }
+    if (v) { v.reviews = mine.length; v.rating = Math.round(avg * 100) / 100; v.thumbsUp = up; v.thumbsDown = down; }
     memSave();
-    return { count: mine.length, rating: Math.round(avg * 100) / 100 };
+    return { count: mine.length, rating: Math.round(avg * 100) / 100, thumbsUp: up, thumbsDown: down };
   },
 
   async listReviewsForVendor(vendorId) {
     if (usingPg) {
       try {
         const r = await query(`SELECT * FROM reviews WHERE vendor_id=$1 ORDER BY created_at DESC`, [vendorId]);
-        return r.rows.map((x) => ({ author: x.author_name, rating: x.rating, text: x.body, date: new Date(x.created_at).toLocaleDateString() }));
+        return r.rows.map((x) => ({ author: x.author_name, rating: x.rating, text: x.body, date: new Date(x.created_at).toLocaleDateString(), thumbs: x.thumbs || null }));
       } catch (e) { return []; }
     }
     const db = getDb();
     return (db.reviews || []).filter((r) => r.vendorId === vendorId)
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      .map((r) => ({ author: r.authorName, rating: r.rating, text: r.body, date: new Date(r.createdAt).toLocaleDateString() }));
+      .map((r) => ({ author: r.authorName, rating: r.rating, text: r.body, date: new Date(r.createdAt).toLocaleDateString(), thumbs: r.thumbs || null }));
   },
 
   /* ── response time — computed from real message timestamps ────────────
