@@ -60,7 +60,7 @@ export function sendResetEmail(to, link) {
 
 // Contact form → routed to the team inbox. `replyTo` lets us reply straight to the sender.
 export function sendContactEmail({ name, email, subject, body }) {
-  const to = process.env.CONTACT_TO || "eventvendors.ca@gmail.com";
+  const to = process.env.CONTACT_TO || "Inquiry@eventvendors.us";
   return send({
     to, subject: `[Contact] ${subject || "(no subject)"}`,
     html: shell("New contact message", `
@@ -95,7 +95,7 @@ export function sendNotificationEmail(to, text) {
 }
 
 export function sendReportNotificationEmail({ vendorId, userId, reasons, reason, reporterEmail }) {
-  const to = process.env.CONTACT_TO || "eventvendors.ca@gmail.com";
+  const to = process.env.CONTACT_TO || "Inquiry@eventvendors.us";
   const target = vendorId ? `Vendor #${vendorId}` : `User #${userId}`;
   return send({
     to, subject: `[Report] ${target} flagged — review needed`,
@@ -135,7 +135,7 @@ export function sendLicenceRejectedEmail(to, vendorName, reason) {
         <li>Wrong document type — upload the specific licence required for your service</li>
       </ul>
       <p style="text-align:center;margin:24px 0"><a href="${process.env.APP_URL}" style="background:#E26D4F;color:#fff;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:700">Update your listing →</a></p>
-      <p style="font-size:12px;color:#8a8594">If you believe this is an error, please contact us at ${process.env.CONTACT_TO || "eventvendors.ca@gmail.com"}.</p>`),
+      <p style="font-size:12px;color:#8a8594">If you believe this is an error, please contact us at ${process.env.CONTACT_TO || "Inquiry@eventvendors.us"}.</p>`),
   });
 }
 
