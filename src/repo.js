@@ -88,6 +88,42 @@ export const repo = {
     return getDb().users.find((u) => String(u.id) === String(id)) || null;
   },
 
+  /* ── password reset ─────────────────────────────────────────────────── */
+
+  async setResetToken(email, token, expiresAt) {
+    if (usingPg) {
+      try {
+        const r = await query("UPDATE users SET reset_token=$2, reset_token_expires=$3 WHERE email=$1 RETURNING id", [email, token, expiresAt]);
+        return r.rowCount > 0;
+      } catch (e) {
+        if (!/column .* does not exist/i.test(e.message)) throw e;
+        console.error("[repo] setResetToken: reset_token columns missing — run schema_v11.sql in Supabase.", e.message);
+        return false;
+      }
+    }
+    const u = getDb().users.find((x) => x.email === email);
+    if (!u) return false;
+    u.resetToken = token; u.resetTokenExpires = expiresAt; memSave(); return true;
+  },
+
+  async resetPasswordByToken(token, passwordHash) {
+    if (usingPg) {
+      try {
+        const r = await query(
+          `UPDATE users SET password_hash=$2, reset_token=NULL, reset_token_expires=NULL
+           WHERE reset_token=$1 AND reset_token_expires > now() RETURNING id`,
+          [token, passwordHash]);
+        return r.rowCount > 0;
+      } catch (e) {
+        if (!/column .* does not exist/i.test(e.message)) throw e;
+        return false;
+      }
+    }
+    const u = getDb().users.find((x) => x.resetToken === token && x.resetTokenExpires && new Date(x.resetTokenExpires) > new Date());
+    if (!u) return false;
+    u.passwordHash = passwordHash; u.resetToken = null; u.resetTokenExpires = null; memSave(); return true;
+  },
+
   async listUsers() {
     if (usingPg) return (await query("SELECT * FROM users ORDER BY id")).rows.map(toUser);
     return getDb().users.slice();

@@ -13,7 +13,8 @@ import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
 import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
-import { sendVerifyEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
+import crypto from "crypto";
+import { sendVerifyEmail, sendResetEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
@@ -197,6 +198,32 @@ app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }), h(
 }));
 
 app.get("/api/auth/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
+
+app.post("/api/auth/forgot", rateLimit({ windowMs: 60 * 60 * 1000, max: 5 }), h(async (req, res) => {
+  const email = (req.body?.email || "").trim().toLowerCase();
+  // Always respond success either way — never reveal whether an email is registered.
+  if (email) {
+    const user = await repo.findUserByEmail(email);
+    if (user) {
+      const token = crypto.randomBytes(32).toString("hex");
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutes, matches the email copy
+      const ok = await repo.setResetToken(email, token, expiresAt);
+      if (ok) {
+        const link = `${APP_URL}/?reset=${token}`;
+        sendResetEmail(email, link).catch(() => {});
+      }
+    }
+  }
+  res.json({ ok: true });
+}));
+
+app.post("/api/auth/reset", rateLimit({ windowMs: 60 * 60 * 1000, max: 10 }), h(async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password || password.length < 8) return res.status(400).json({ error: "A valid token and a password of at least 8 characters are required." });
+  const ok = await repo.resetPasswordByToken(token, hashPassword(password));
+  if (!ok) return res.status(400).json({ error: "This reset link is invalid or has expired. Please request a new one." });
+  res.json({ ok: true });
+}));
 
 /* ── account settings (customers & vendors) ────────────────────────────── */
 app.get("/api/account", auth, (req, res) => res.json(publicUser(req.user)));
