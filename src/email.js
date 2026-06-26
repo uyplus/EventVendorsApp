@@ -38,6 +38,30 @@ const shell = (title, body) => `
     <p style="font-size:12px;color:#8a8594;margin-top:28px">Event Vendors — your vision, our expertise.</p>
   </div>`;
 
+export function sendWelcomeEmail(to, firstName, role) {
+  const name = firstName || "there";
+  const body = role === "vendor"
+    ? `<p>Hi ${name}, welcome to Event Vendors!</p>
+       <p>Your listing is live. A few things worth doing next: add photos, set your starting price, and if your service needs one, upload your licence so customers see a verified badge on your profile.</p>
+       <p>Quote requests and messages from customers will show up in your dashboard inbox, and we'll email you the moment one arrives.</p>
+       <p><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Go to your dashboard</a></p>`
+    : `<p>Hi ${name}, welcome to Event Vendors!</p>
+       <p>You can now browse vendors by category, filter by price, rating, and location, and message vendors directly to request a quote or book a date, all free.</p>
+       <p><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#E26D4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Start browsing</a></p>`;
+  return send({ to, subject: "Welcome to Event Vendors", html: shell("Welcome!", body) });
+}
+
+export function sendNewMessageEmail(to, fromName, preview, link) {
+  const trimmed = (preview || "").slice(0, 160);
+  return send({
+    to, subject: `New message from ${fromName} — Event Vendors`,
+    html: shell("You have a new message", `
+      <p><b>${fromName}</b> sent you a message:</p>
+      <p style="background:#F6F1E9;border-radius:10px;padding:12px 14px;color:#1E1A2B;font-style:italic">"${trimmed}${trimmed.length === 160 ? "…" : ""}"</p>
+      <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Reply now</a></p>`),
+  });
+}
+
 export function sendVerifyEmail(to, link) {
   return send({
     to, subject: "Verify your Event Vendors account",

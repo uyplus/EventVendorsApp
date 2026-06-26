@@ -13,7 +13,7 @@ import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
 import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
-import { sendVerifyEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
+import { sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
@@ -169,6 +169,7 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
   // No-throw: a mail failure never blocks signup.
   const verifyLink = `${APP_URL}/?verify=${emailToken}`;
   sendVerifyEmail(email, verifyLink).catch(() => {});
+  sendWelcomeEmail(email, user.firstName, role).catch(() => {});
   res.status(201).json({ token: signToken(user), user: publicUser(user) });
 }));
 
@@ -291,6 +292,16 @@ app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(asyn
   const b = req.body || {};
   if (!b.vendorId) return res.status(400).json({ error: "vendorId is required." });
   const id = await repo.createQuote(b);
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(b.vendorId);
+      const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      if (vendorUser?.email) {
+        const preview = `Quote request${b.eventDate ? " for " + b.eventDate : ""}${b.guests ? ` · ${b.guests} guests` : ""}.${b.notes ? " " + b.notes : ""}`;
+        await sendNewMessageEmail(vendorUser.email, b.name || "A customer", preview, `${APP_URL}/?inbox=1`);
+      }
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true, id });
 }));
 
@@ -328,6 +339,18 @@ app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 })
   if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
   const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind });
   await repo.addThreadMessage(thread.id, "customer", body);
+  // Email the vendor — this is what makes a message actually reach someone
+  // instead of just sitting unread in a dashboard inbox they may not check.
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(vendorId);
+      const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      if (vendorUser?.email) {
+        const fromName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "A customer";
+        await sendNewMessageEmail(vendorUser.email, fromName, body, `${APP_URL}/?inbox=1`);
+      }
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true, threadId: "th" + thread.id });
 }));
 
@@ -344,7 +367,27 @@ app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, m
   const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
   const { body } = req.body || {};
   if (!body) return res.status(400).json({ error: "body is required." });
-  await repo.addThreadMessage(threadId, req.user.role === "vendor" ? "vendor" : "customer", body);
+  const senderRole = req.user.role === "vendor" ? "vendor" : "customer";
+  await repo.addThreadMessage(threadId, senderRole, body);
+  // Email whichever party did NOT just send this — a reply is exactly the
+  // moment someone is actively waiting to hear back.
+  (async () => {
+    try {
+      const thread = await repo.getThreadById(threadId);
+      if (!thread) return;
+      const fromName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || (senderRole === "vendor" ? "A vendor" : "A customer");
+      let recipientEmail = null;
+      if (senderRole === "vendor") {
+        const customer = await repo.findUserById(thread.customer_id);
+        recipientEmail = customer?.email;
+      } else {
+        const vendor = await repo.findVendorById(thread.vendor_id);
+        const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+        recipientEmail = vendorUser?.email;
+      }
+      if (recipientEmail) await sendNewMessageEmail(recipientEmail, fromName, body, `${APP_URL}/?inbox=1`);
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true });
 }));
 
@@ -356,7 +399,15 @@ app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 })
   const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, eventDate: date || null, guests: guests || null, location: location || "" });
   // Drop a thread message too, so the booking shows up in the vendor's inbox as well as their bookings list.
   const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking confirmed", kind: "booking" }).catch(() => null);
-  if (thread) await repo.addThreadMessage(thread.id, "customer", `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`).catch(() => {});
+  const bookingText = `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`;
+  if (thread) await repo.addThreadMessage(thread.id, "customer", bookingText).catch(() => {});
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(vendorId);
+      const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      if (vendorUser?.email) await sendNewMessageEmail(vendorUser.email, customerName, bookingText, `${APP_URL}/?inbox=1`);
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true, id: "bk" + booking.id });
 }));
 

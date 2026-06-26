@@ -532,6 +532,13 @@ export const repo = {
 
   // ── messaging (two-sided: a thread links one customer + one vendor) ──────
 
+  async getThreadById(threadId) {
+    if (usingPg) return (await query("SELECT * FROM threads WHERE id=$1", [threadId])).rows[0] || null;
+    const db = getDb();
+    const t = (db.threads || []).find((x) => x.id === threadId);
+    return t ? { id: t.id, vendor_id: t.vendorId, customer_id: t.customerId } : null;
+  },
+
   async getOrCreateThread({ vendorId, customerId, subject, kind }) {
     if (usingPg) {
       const existing = await query(`SELECT * FROM threads WHERE vendor_id=$1 AND customer_id=$2`, [vendorId, customerId]);
