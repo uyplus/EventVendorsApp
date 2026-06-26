@@ -13,8 +13,7 @@ import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
 import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
-import crypto from "crypto";
-import { sendVerifyEmail, sendResetEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
+import { sendVerifyEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
@@ -194,36 +193,23 @@ app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }), h(
   if (!user || !checkPassword(req.body?.password || "", user.passwordHash))
     return res.status(401).json({ error: "Invalid email or password." });
   if (user.suspended) return res.status(403).json({ error: "This account has been suspended." });
+  // Each email is tied to exactly one role at signup — reject a mismatched
+  // login explicitly instead of silently logging them into their real role
+  // regardless of which toggle was selected, which just looks confusing.
+  const requestedRole = req.body?.role === "vendor" ? "vendor" : "customer";
+  if (requestedRole !== user.role) {
+    return res.status(403).json({ error: `This email is registered as a ${user.role}. Please select "I'm a ${user.role}" to log in.`, actualRole: user.role });
+  }
   res.json({ token: signToken(user), user: publicUser(user) });
 }));
 
 app.get("/api/auth/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
 
-app.post("/api/auth/forgot", rateLimit({ windowMs: 60 * 60 * 1000, max: 5 }), h(async (req, res) => {
-  const email = (req.body?.email || "").trim().toLowerCase();
-  // Always respond success either way — never reveal whether an email is registered.
-  if (email) {
-    const user = await repo.findUserByEmail(email);
-    if (user) {
-      const token = crypto.randomBytes(32).toString("hex");
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutes, matches the email copy
-      const ok = await repo.setResetToken(email, token, expiresAt);
-      if (ok) {
-        const link = `${APP_URL}/?reset=${token}`;
-        sendResetEmail(email, link).catch(() => {});
-      }
-    }
-  }
-  res.json({ ok: true });
-}));
-
-app.post("/api/auth/reset", rateLimit({ windowMs: 60 * 60 * 1000, max: 10 }), h(async (req, res) => {
-  const { token, password } = req.body || {};
-  if (!token || !password || password.length < 8) return res.status(400).json({ error: "A valid token and a password of at least 8 characters are required." });
-  const ok = await repo.resetPasswordByToken(token, hashPassword(password));
-  if (!ok) return res.status(400).json({ error: "This reset link is invalid or has expired. Please request a new one." });
-  res.json({ ok: true });
-}));
+// Password reset (forgot/reset) lives in features.js, mounted below via
+// mountFeatures() — it already uses securely hashed tokens in a dedicated
+// password_reset_tokens table. A duplicate pair of routes used to live
+// here too; removed, since two handlers registered for the same path is
+// exactly the kind of thing that causes silent, confusing bugs later.
 
 /* ── account settings (customers & vendors) ────────────────────────────── */
 app.get("/api/account", auth, (req, res) => res.json(publicUser(req.user)));
