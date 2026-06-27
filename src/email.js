@@ -41,14 +41,23 @@ const shell = (title, body) => `
 export function sendWelcomeEmail(to, firstName, role) {
   const name = firstName || "there";
   const body = role === "vendor"
-    ? `<p>Hi ${name}, welcome to Event Vendors!</p>
-       <p>Your listing is live. A few things worth doing next: add photos, set your starting price, and if your service needs one, upload your licence so customers see a verified badge on your profile.</p>
-       <p>Quote requests and messages from customers will show up in your dashboard inbox, and we'll email you the moment one arrives.</p>
-       <p><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Go to your dashboard</a></p>`
-    : `<p>Hi ${name}, welcome to Event Vendors!</p>
-       <p>You can now browse vendors by category, filter by price, rating, and location, and message vendors directly to request a quote or book a date, all free.</p>
-       <p><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#E26D4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Start browsing</a></p>`;
-  return send({ to, subject: "Welcome to Event Vendors", html: shell("Welcome!", body) });
+    ? `<p>Dear ${name},</p>
+       <p>Thank you for registering your business with Event Vendors. We are delighted to welcome you to our growing community of trusted event professionals, and we look forward to supporting you as you connect with customers planning their next event.</p>
+       <p>To get the most out of your listing, we would recommend the following:</p>
+       <ul style="padding-left:18px;color:#1E1A2B">
+         <li>Add photos that showcase your work</li>
+         <li>Set your starting price so customers know what to expect</li>
+         <li>If your service requires one, upload your licence so customers see a verified badge on your profile</li>
+       </ul>
+       <p>Quote requests and messages from customers will appear in your dashboard inbox, and we will notify you by email the moment one arrives.</p>
+       <p><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Go to your dashboard</a></p>
+       <p>Welcome aboard.</p>`
+    : `<p>Dear ${name},</p>
+       <p>Thank you for joining Event Vendors. We are delighted to welcome you, and we look forward to helping you find the right vendors for your next event.</p>
+       <p>You may now browse vendors by category, filter by price, rating, and location, and message vendors directly to request a quote or book a date, entirely free of charge.</p>
+       <p><a href="${process.env.APP_URL || "https://eventvendors.us"}" style="background:#E26D4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Start browsing</a></p>
+       <p>Welcome aboard.</p>`;
+  return send({ to, subject: `Welcome to Event Vendors, ${name}`, html: shell("Welcome to Event Vendors", body) });
 }
 
 export function sendNewMessageEmail(to, fromName, preview, link) {
@@ -62,13 +71,16 @@ export function sendNewMessageEmail(to, fromName, preview, link) {
   });
 }
 
-export function sendVerifyEmail(to, link) {
+export function sendVerifyEmail(to, link, firstName) {
+  const name = firstName || "there";
   return send({
-    to, subject: "Verify your Event Vendors account",
-    html: shell("Confirm your email", `
-      <p>Welcome! Please confirm your email to activate your account.</p>
-      <p><a href="${link}" style="background:#E26D4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Verify email</a></p>
-      <p style="font-size:12px;color:#8a8594">Or paste this link: ${link}</p>`),
+    to, subject: "Please confirm your email — Event Vendors",
+    html: shell("Confirm your email address", `
+      <p>Dear ${name},</p>
+      <p>Thank you for creating an account with Event Vendors. To activate your account and ensure the security of your profile, please confirm your email address by clicking the button below.</p>
+      <p><a href="${link}" style="background:#E26D4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Confirm my email</a></p>
+      <p style="font-size:12px;color:#8a8594">If the button above does not work, please copy and paste this link into your browser: ${link}</p>
+      <p style="font-size:12px;color:#8a8594">If you did not create this account, you may safely disregard this email.</p>`),
   });
 }
 

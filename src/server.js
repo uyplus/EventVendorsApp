@@ -156,6 +156,7 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       cuisines: b.cuisines && b.cuisines.length ? b.cuisines : null, services, hue: 200,
       experienceSinceYear: b.experienceSinceYear ?? null,
       serviceAreas: Array.isArray(b.serviceAreas) ? b.serviceAreas : [],
+      instagramHandle: b.instagramHandle || null, facebookHandle: b.facebookHandle || null, tiktokHandle: b.tiktokHandle || null,
     });
     // Founding-vendor perk: first 100 real signups get Premium, free, no expiry.
     // Isolated from vendor creation itself — if this fails (e.g. schema_v8.sql
@@ -168,15 +169,22 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
   // Send a registration confirmation / verification email with an activation link.
   // No-throw: a mail failure never blocks signup.
   const verifyLink = `${APP_URL}/?verify=${emailToken}`;
-  sendVerifyEmail(email, verifyLink).catch(() => {});
+  sendVerifyEmail(email, verifyLink, user.firstName).catch(() => {});
   sendWelcomeEmail(email, user.firstName, role).catch(() => {});
   res.status(201).json({ token: signToken(user), user: publicUser(user) });
 }));
 
 app.get("/api/auth/verify", h(async (req, res) => {
-  const ok = await repo.verifyEmail(req.query.token);
-  if (!ok) return res.status(400).json({ error: "Invalid or expired verification link." });
-  res.json({ ok: true, verified: true });
+  const userId = await repo.verifyEmail(req.query.token);
+  if (!userId) return res.status(400).json({ error: "Invalid or expired verification link." });
+  // Clicking an email link often opens in an isolated in-app browser
+  // (Gmail/Outlook's own preview webview), a separate storage context from
+  // wherever someone was actually logged in — which looks exactly like
+  // being logged out, even though nothing was actually cleared. Issuing a
+  // fresh session here means verifying actively logs you in, in whichever
+  // context the link happens to open, instead of leaving that to chance.
+  const user = await repo.findUserById(userId);
+  res.json({ ok: true, verified: true, token: user ? signToken(user) : null, user: user ? publicUser(user) : null });
 }));
 
 // Contact form (public, rate-limited) → emails the team inbox.
@@ -326,6 +334,9 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.startingPrice !== undefined) patch.startingPrice = b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null);
   if (b.equipmentHire !== undefined) patch.equipmentHire = !!b.equipmentHire;
   if (b.fullService !== undefined) patch.fullService = !!b.fullService;
+  if (b.instagramHandle !== undefined) patch.instagramHandle = b.instagramHandle || null;
+  if (b.facebookHandle !== undefined) patch.facebookHandle = b.facebookHandle || null;
+  if (b.tiktokHandle !== undefined) patch.tiktokHandle = b.tiktokHandle || null;
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);

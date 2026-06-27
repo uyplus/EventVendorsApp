@@ -42,6 +42,9 @@ const toVendor = (r) => r && ({
   experienceSinceYear: r.experience_since_year ?? null,
   serviceAreas: r.service_areas || [],
   priceListPath: r.price_list_path || null,
+  instagramHandle: r.instagram_handle || null,
+  facebookHandle: r.facebook_handle || null,
+  tiktokHandle: r.tiktok_handle || null,
 });
 const toReport = (r) => r && ({
   id: Number(r.id), vendorId: r.vendor_id == null ? null : Number(r.vendor_id),
@@ -99,9 +102,13 @@ export const repo = {
   },
 
   async verifyEmail(token) {
-    if (usingPg) return (await query("UPDATE users SET verified=TRUE, email_token=NULL WHERE email_token=$1 RETURNING id", [token])).rowCount > 0;
+    if (usingPg) {
+      const r = await query("UPDATE users SET verified=TRUE, email_token=NULL WHERE email_token=$1 RETURNING id", [token]);
+      return r.rows[0]?.id || null;
+    }
     const u = getDb().users.find((x) => x.emailToken && x.emailToken === token);
-    if (!u) return false; u.verified = true; u.emailToken = null; memSave(); return true;
+    if (!u) return null;
+    u.verified = true; u.emailToken = null; memSave(); return u.id;
   },
 
   async setUserSuspended(id, val) {
@@ -303,6 +310,7 @@ export const repo = {
 
   /* ── vendors ────────────────────────────────────────────────────────── */
   async createVendor(v) {
+    let vendor;
     if (usingPg) {
       try {
         const r = await query(
@@ -315,7 +323,7 @@ export const repo = {
            J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
            v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3,
            v.experienceSinceYear ?? null, J(v.serviceAreas || []), v.priceListPath || null]);
-        return toVendor(r.rows[0]);
+        vendor = toVendor(r.rows[0]);
       } catch (e) {
         // Defensive fallback: if experience_since_year / service_areas / price_list_path
         // don't exist yet (schema_v5.sql / schema_v6.sql not run), don't let a brand new
@@ -332,11 +340,26 @@ export const repo = {
            v.fullService === undefined ? true : !!v.fullService, v.years ?? 0, J(v.languages || ["English"]),
            J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
            v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3]);
-        return toVendor(r.rows[0]);
+        vendor = toVendor(r.rows[0]);
       }
+      // Social handles, set via a separate isolated update rather than baked
+      // into the INSERT above — keeps that already-complex statement
+      // untouched, and means a missing schema_v12.sql just skips this
+      // instead of risking the vendor record itself.
+      if (v.instagramHandle || v.facebookHandle || v.tiktokHandle) {
+        try {
+          await query(`UPDATE vendors SET instagram_handle=$2, facebook_handle=$3, tiktok_handle=$4 WHERE id=$1`,
+            [vendor.id, v.instagramHandle || null, v.facebookHandle || null, v.tiktokHandle || null]);
+          vendor.instagramHandle = v.instagramHandle || null; vendor.facebookHandle = v.facebookHandle || null; vendor.tiktokHandle = v.tiktokHandle || null;
+        } catch (e) {
+          if (!/column .* does not exist/i.test(e.message)) throw e;
+          console.error("[repo] createVendor: social handle columns missing — run schema_v12.sql in Supabase. Skipped.", e.message);
+        }
+      }
+      return vendor;
     }
     const db = getDb();
-    const vendor = { id: nextId("vendor"), ownerUserId: v.ownerUserId ?? null, name: v.name || "",
+    vendor = { id: nextId("vendor"), ownerUserId: v.ownerUserId ?? null, name: v.name || "",
       cat: v.cat || "mgmt", offering: v.offering || "", price: v.price ?? 2,
       startingPrice: v.startingPrice === undefined ? 0 : v.startingPrice, // preserve explicit null (N/A) — only default when truly unset
       city: v.city || "", region: v.region || "", country: v.country || "US", distance: v.distance ?? 0,
@@ -347,7 +370,8 @@ export const repo = {
       services: v.services || {}, photos: v.photos || [], blockedDates: [], about: v.about || "",
       pitch: v.pitch || "", businessAddress: v.businessAddress || "", businessPhone: v.businessPhone || "",
       hue: v.hue ?? 200, maxPhotos: v.maxPhotos ?? 3, createdAt: new Date().toISOString(),
-      experienceSinceYear: v.experienceSinceYear ?? null, serviceAreas: v.serviceAreas || [], priceListPath: v.priceListPath || null };
+      experienceSinceYear: v.experienceSinceYear ?? null, serviceAreas: v.serviceAreas || [], priceListPath: v.priceListPath || null,
+      instagramHandle: v.instagramHandle || null, facebookHandle: v.facebookHandle || null, tiktokHandle: v.tiktokHandle || null };
     db.vendors.push(vendor); memSave(); return vendor;
   },
 
@@ -390,17 +414,18 @@ export const repo = {
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
              experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
-             equipment_hire=$17, full_service=$18 WHERE id=$1 RETURNING *`,
+             equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21 WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
            !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
            merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
            merged.startingPrice === undefined ? null : merged.startingPrice,
-           !!merged.equipmentHire, !!merged.fullService]);
+           !!merged.equipmentHire, !!merged.fullService,
+           merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null]);
         return toVendor(r.rows[0]);
       } catch (e) {
         if (!/column .* does not exist/i.test(e.message)) throw e;
-        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql and schema_v6.sql in Supabase. Falling back. Detail:", e.message);
+        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql, schema_v6.sql, and schema_v12.sql in Supabase. Falling back. Detail:", e.message);
         const r = await query(
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12 WHERE id=$1 RETURNING *`,
