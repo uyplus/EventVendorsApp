@@ -611,7 +611,10 @@ export const repo = {
           id: "th" + t.id, vendorId: t.vendor_id, vendorName: t.vendor_name,
           customerName: `${t.first_name || ""} ${t.last_name || ""}`.trim(), subject: t.subject, kind: t.kind,
           unread: msgs.some((m) => !m.read && m.sender_role !== role),
-          messages: msgs.map((m) => ({ from: m.sender_role === "vendor" ? "vendor" : "me", text: m.body, time: m.created_at })),
+          // "me" must mean "whoever is currently looking at this" — not
+          // hardcoded to one side. A vendor viewing their own inbox needs
+          // their own replies to render as "me", not as the other party.
+          messages: msgs.map((m) => ({ from: m.sender_role === role ? "me" : m.sender_role, text: m.body, time: m.created_at })),
         });
       }
       return out;
@@ -627,7 +630,7 @@ export const repo = {
         customerName: customer ? `${customer.firstName || ""} ${customer.lastName || ""}`.trim() : "Customer",
         subject: t.subject, kind: t.kind,
         unread: msgs.some((m) => !m.read && m.senderRole !== role),
-        messages: msgs.map((m) => ({ from: m.senderRole === "vendor" ? "vendor" : "me", text: m.body, time: m.createdAt })),
+        messages: msgs.map((m) => ({ from: m.senderRole === role ? "me" : m.senderRole, text: m.body, time: m.createdAt })),
       };
     }).sort((a, b) => b.id.localeCompare(a.id));
   },
