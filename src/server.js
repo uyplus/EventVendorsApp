@@ -157,6 +157,7 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       experienceSinceYear: b.experienceSinceYear ?? null,
       serviceAreas: Array.isArray(b.serviceAreas) ? b.serviceAreas : [],
       instagramHandle: b.instagramHandle || null, facebookHandle: b.facebookHandle || null, tiktokHandle: b.tiktokHandle || null,
+      operatingHours: b.operatingHours || null,
     });
     // Founding-vendor perk: first 100 real signups get Premium, free, no expiry.
     // Isolated from vendor creation itself — if this fails (e.g. schema_v8.sql
@@ -337,6 +338,7 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.instagramHandle !== undefined) patch.instagramHandle = b.instagramHandle || null;
   if (b.facebookHandle !== undefined) patch.facebookHandle = b.facebookHandle || null;
   if (b.tiktokHandle !== undefined) patch.tiktokHandle = b.tiktokHandle || null;
+  if (b.operatingHours !== undefined) patch.operatingHours = b.operatingHours || null;
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);

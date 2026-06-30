@@ -43,8 +43,8 @@ const toVendor = (r) => r && ({
   serviceAreas: r.service_areas || [],
   priceListPath: r.price_list_path || null,
   instagramHandle: r.instagram_handle || null,
-  facebookHandle: r.facebook_handle || null,
-  tiktokHandle: r.tiktok_handle || null,
+  facebookHandle: r.facebook_handle || null, tiktokHandle: r.tiktok_handle || null,
+  operatingHours: r.operating_hours || null,
 });
 const toReport = (r) => r && ({
   id: Number(r.id), vendorId: r.vendor_id == null ? null : Number(r.vendor_id),
@@ -356,6 +356,16 @@ export const repo = {
           console.error("[repo] createVendor: social handle columns missing — run schema_v12.sql in Supabase. Skipped.", e.message);
         }
       }
+      // Same isolated-update pattern for operating hours.
+      if (v.operatingHours) {
+        try {
+          await query(`UPDATE vendors SET operating_hours=$2 WHERE id=$1`, [vendor.id, J(v.operatingHours)]);
+          vendor.operatingHours = v.operatingHours;
+        } catch (e) {
+          if (!/column .* does not exist/i.test(e.message)) throw e;
+          console.error("[repo] createVendor: operating_hours column missing — run schema_v13.sql in Supabase. Skipped.", e.message);
+        }
+      }
       return vendor;
     }
     const db = getDb();
@@ -371,7 +381,8 @@ export const repo = {
       pitch: v.pitch || "", businessAddress: v.businessAddress || "", businessPhone: v.businessPhone || "",
       hue: v.hue ?? 200, maxPhotos: v.maxPhotos ?? 3, createdAt: new Date().toISOString(),
       experienceSinceYear: v.experienceSinceYear ?? null, serviceAreas: v.serviceAreas || [], priceListPath: v.priceListPath || null,
-      instagramHandle: v.instagramHandle || null, facebookHandle: v.facebookHandle || null, tiktokHandle: v.tiktokHandle || null };
+      instagramHandle: v.instagramHandle || null, facebookHandle: v.facebookHandle || null, tiktokHandle: v.tiktokHandle || null,
+      operatingHours: v.operatingHours || null };
     db.vendors.push(vendor); memSave(); return vendor;
   },
 
@@ -414,18 +425,20 @@ export const repo = {
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
              experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
-             equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21 WHERE id=$1 RETURNING *`,
+             equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21,
+             operating_hours=$22 WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
            !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
            merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
            merged.startingPrice === undefined ? null : merged.startingPrice,
            !!merged.equipmentHire, !!merged.fullService,
-           merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null]);
+           merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null,
+           merged.operatingHours ? J(merged.operatingHours) : null]);
         return toVendor(r.rows[0]);
       } catch (e) {
         if (!/column .* does not exist/i.test(e.message)) throw e;
-        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql, schema_v6.sql, and schema_v12.sql in Supabase. Falling back. Detail:", e.message);
+        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql, schema_v6.sql, schema_v12.sql, and schema_v13.sql in Supabase. Falling back. Detail:", e.message);
         const r = await query(
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12 WHERE id=$1 RETURNING *`,
