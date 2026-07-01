@@ -45,6 +45,12 @@ const toVendor = (r) => r && ({
   instagramHandle: r.instagram_handle || null,
   facebookHandle: r.facebook_handle || null, tiktokHandle: r.tiktok_handle || null,
   operatingHours: r.operating_hours || null,
+  // claim-your-profile fields
+  claimed: r.claimed ?? true,
+  prePopulated: r.pre_populated ?? false,
+  sourceUrl: r.source_url || null,
+  website: r.website || null,
+  claimTokenExpires: r.claim_token_expires || null,
 });
 const toReport = (r) => r && ({
   id: Number(r.id), vendorId: r.vendor_id == null ? null : Number(r.vendor_id),
@@ -708,5 +714,111 @@ export const repo = {
     const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && x.customerId === customerId);
     if (!b) return false;
     b.status = "cancelled"; memSave(); return true;
+  },
+
+  /* ── claim-your-profile ─────────────────────────────────────────────── */
+
+  // Look up an unclaimed vendor by its single-use claim token.
+  async findVendorByClaimToken(token) {
+    if (!token) return null;
+    if (usingPg) {
+      const r = await query(
+        `SELECT *, claim_token_expires AS "claimTokenExpires" FROM vendors WHERE claim_token = $1 LIMIT 1`,
+        [token]
+      );
+      return r.rows[0] ? toVendor({ ...r.rows[0], claimTokenExpires: r.rows[0].claimTokenExpires }) : null;
+    }
+    return (getDb().vendors || []).find((v) => v.claimToken === token) || null;
+  },
+
+  // Persist a fresh claim token + expiry on a pre-populated vendor so we can
+  // send it in the claim email. Safe to call multiple times (overwrites).
+  async setClaimToken(vendorId, token, expiresIso) {
+    if (usingPg) {
+      await query(
+        `UPDATE vendors SET claim_token = $2, claim_token_expires = $3 WHERE id = $1`,
+        [vendorId, token, expiresIso]
+      );
+      return;
+    }
+    const v = (getDb().vendors || []).find((x) => String(x.id) === String(vendorId));
+    if (v) { v.claimToken = token; v.claimTokenExpires = expiresIso; memSave(); }
+  },
+
+  // Transfer ownership once the vendor has created their account via the claim link.
+  async claimVendor(vendorId, userId, _usedToken) {
+    if (usingPg) {
+      await query(
+        `UPDATE vendors
+            SET owner_user_id        = $2,
+                claimed              = true,
+                claim_token          = NULL,
+                claim_token_expires  = NULL
+          WHERE id = $1`,
+        [vendorId, userId]
+      );
+      return;
+    }
+    const v = (getDb().vendors || []).find((x) => String(x.id) === String(vendorId));
+    if (v) {
+      v.ownerUserId = userId; v.claimed = true;
+      v.claimToken = null; v.claimTokenExpires = null;
+      memSave();
+    }
+  },
+
+  // Insert a vendor row sourced from an external scraper (Google / Yelp / CSV).
+  // Returns null (silently) if source_id already exists — idempotent scraping.
+  async insertPrePopulatedVendor(v) {
+    if (usingPg) {
+      try {
+        const r = await query(
+          `INSERT INTO vendors
+             (name, cat, city, region, country,
+              about, business_phone, website,
+              hue, plan, languages, photos, offering, services,
+              pre_populated, claimed, source, source_id, source_url,
+              claim_token, claim_token_expires,
+              rating, reviews, max_photos, price, starting_price,
+              full_service, years, service_areas)
+           VALUES
+             ($1,$2,$3,$4,$5,
+              $6,$7,$8,
+              $9,$10,$11,$12,$13,$14,
+              true,false,$15,$16,$17,
+              $18,$19,
+              $20,$21,$22,$23,$24,
+              true,0,'{}')
+           ON CONFLICT (source_id)
+             WHERE source_id IS NOT NULL
+             DO NOTHING
+           RETURNING id`,
+          [
+            v.name, v.cat || "eventmgmt", v.city || "", v.region || "", v.country || "US",
+            v.about || "", v.phone || "", v.website || "",
+            v.hue ?? 220, "free",
+            J(["English"]), J(v.photos || []), "", J({}),
+            v.source || "manual", v.sourceId || null, v.sourceUrl || null,
+            v.claimToken, v.claimTokenExpires,
+            v.rating ?? 0, v.reviews ?? 0, 10, 2, 0,
+          ]
+        );
+        return r.rows[0]?.id ?? null;
+      } catch (e) {
+        // If schema_v14 hasn't been run yet, skip gracefully
+        if (/column .* does not exist/i.test(e.message)) {
+          console.warn("[repo] insertPrePopulatedVendor: run schema_v14.sql first.", e.message);
+          return null;
+        }
+        throw e;
+      }
+    }
+    // In-memory fallback: just push (no dedup by source_id for local dev)
+    const db = getDb();
+    if ((db.vendors || []).some((x) => x.sourceId && x.sourceId === v.sourceId)) return null;
+    const vendor = { id: nextId("vendor"), claimed: false, prePopulated: true, ...v, createdAt: new Date().toISOString() };
+    db.vendors = db.vendors || [];
+    db.vendors.push(vendor); memSave();
+    return vendor.id;
   },
 };

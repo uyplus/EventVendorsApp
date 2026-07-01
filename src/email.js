@@ -175,3 +175,29 @@ export function sendLicenceRejectedEmail(to, vendorName, reason) {
   });
 }
 
+
+// ── Claim-your-profile ────────────────────────────────────────────────────────
+export function sendClaimEmail({ to, vendorName, token, baseUrl }) {
+  const claimUrl = `${baseUrl || process.env.APP_URL || "https://eventvendors.us"}?claim=${token}`;
+  return send({
+    to,
+    subject: `Your ${vendorName} listing is waiting — claim it free`,
+    html: shell("Claim your listing", `
+      <p>Hi there,</p>
+      <p>Your business <b>${vendorName}</b> is already listed on Event Vendors — couples and event planners can find it right now.</p>
+      <p>Claim your free listing to:</p>
+      <ul>
+        <li>Add professional photos and a full description</li>
+        <li>Set your starting price and service packages</li>
+        <li>Receive quote requests and messages directly</li>
+        <li>Get your <b>Founding badge</b> — exclusive to our first 100 vendors</li>
+      </ul>
+      <p style="text-align:center;margin:28px 0">
+        <a href="${claimUrl}" style="background:#C9A227;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px">
+          Claim my listing — it's free →
+        </a>
+      </p>
+      <p style="font-size:12px;color:#8a8594">This link expires in 48 hours. If you didn't request it, safely ignore this email.</p>
+      <p style="font-size:12px;color:#8a8594">Or paste this link: ${claimUrl}</p>`),
+  });
+}

@@ -9,6 +9,7 @@ import { countries, statesOf, citiesOf, source as geoSource } from "./locations.
 import { billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } from "./billing.js";
 import { mountFeatures } from "./features.js";
 import { mountMedia } from "./media.js";
+import { mountClaim } from "./claim.js";
 import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
@@ -505,6 +506,7 @@ app.delete("/api/admin/vendors/:id", admin, h(async (req, res) => {
 mountFeatures(app, { auth, requireVendor, repo });
 // To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
 mountMedia(app, { auth, requireVendor, repo });
+mountClaim(app, { repo, email: emailModule, generateToken });
 mountCompliance(app, {
   auth, requireVendor, repo,
   sendEmail: async ({ to, subject, html }) => {
