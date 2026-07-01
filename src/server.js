@@ -13,8 +13,13 @@ import { mountClaim } from "./claim.js";
 import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
-import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
-import { sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
+import {
+  sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail,
+  sendContactEmail, sendReportNotificationEmail,
+  sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
+  sendClaimEmail,
+} from "./email.js";
+const emailModule = { sendClaimEmail };
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
@@ -339,6 +344,7 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.instagramHandle !== undefined) patch.instagramHandle = b.instagramHandle || null;
   if (b.facebookHandle !== undefined) patch.facebookHandle = b.facebookHandle || null;
   if (b.tiktokHandle !== undefined) patch.tiktokHandle = b.tiktokHandle || null;
+  if (b.website !== undefined) patch.website = b.website || null;
   if (b.operatingHours !== undefined) patch.operatingHours = b.operatingHours || null;
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
@@ -403,6 +409,21 @@ app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, m
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.status(201).json({ ok: true });
+}));
+
+// Mark a thread as read (vendor or customer opens their inbox)
+app.post("/api/threads/:id/read", auth, h(async (req, res) => {
+  const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
+  await repo.markThreadRead(threadId, req.user.role);
+  res.json({ ok: true });
+}));
+
+// Vendor enquiry stats — total enquiry threads received (for dashboard)
+app.get("/api/vendor/enquiries/count", auth, requireVendor, h(async (req, res) => {
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.json({ count: 0 });
+  const threads = await repo.listThreadsFor({ role: "vendor", vendorId: listing.id });
+  res.json({ count: threads.length });
 }));
 
 /* ── bookings — free, confirmed immediately, no payment involved ────────── */
@@ -506,7 +527,7 @@ app.delete("/api/admin/vendors/:id", admin, h(async (req, res) => {
 mountFeatures(app, { auth, requireVendor, repo });
 // To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
 mountMedia(app, { auth, requireVendor, repo });
-mountClaim(app, { repo, email: emailModule, generateToken });
+mountClaim(app, { repo, email: emailModule, generateToken: signToken });
 mountCompliance(app, {
   auth, requireVendor, repo,
   sendEmail: async ({ to, subject, html }) => {

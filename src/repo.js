@@ -432,7 +432,7 @@ export const repo = {
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
              experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
              equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21,
-             operating_hours=$22 WHERE id=$1 RETURNING *`,
+             operating_hours=$22, website=$23 WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
            !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
@@ -440,7 +440,8 @@ export const repo = {
            merged.startingPrice === undefined ? null : merged.startingPrice,
            !!merged.equipmentHire, !!merged.fullService,
            merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null,
-           merged.operatingHours ? J(merged.operatingHours) : null]);
+           merged.operatingHours ? J(merged.operatingHours) : null,
+           merged.website || null]);
         return toVendor(r.rows[0]);
       } catch (e) {
         if (!/column .* does not exist/i.test(e.message)) throw e;
