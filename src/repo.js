@@ -822,4 +822,32 @@ export const repo = {
     db.vendors.push(vendor); memSave();
     return vendor.id;
   },
+
+  async listUnclaimedVendors({ q = "", country = "", page = 1, limit = 24 }) {
+    try {
+      if (!usingPg()) {
+        const db = getDb();
+        const all = (db.vendors || []).filter(v => v.prePopulated && !v.claimed);
+        const filtered = q
+          ? all.filter(v =>
+              (v.name||"").toLowerCase().includes(q.toLowerCase()) ||
+              (v.city||"").toLowerCase().includes(q.toLowerCase()))
+          : all;
+        const countryed = country ? filtered.filter(v => v.country===country) : filtered;
+        return countryed.slice((page-1)*limit, page*limit).map(toVendor);
+      }
+      const offset = (page - 1) * limit;
+      const term = q ? `%${q}%` : "%";
+      const params = [term, limit, offset];
+      let sql = `SELECT * FROM vendors WHERE pre_populated = true AND (claimed = false OR claimed IS NULL)
+                 AND (name ILIKE $1 OR city ILIKE $1 OR about ILIKE $1)`;
+      if (country) { sql += ` AND country = $${params.length+1}`; params.push(country); }
+      sql += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+      const result = await query(sql, params);
+      return result.rows.map(toVendor);
+    } catch (e) {
+      console.error("[repo] listUnclaimedVendors:", e.message);
+      return [];
+    }
+  },
 };

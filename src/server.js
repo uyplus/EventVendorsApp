@@ -528,6 +528,25 @@ mountFeatures(app, { auth, requireVendor, repo });
 // To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
 mountMedia(app, { auth, requireVendor, repo });
 mountClaim(app, { repo, email: emailModule, generateToken: signToken });
+
+// ── GET /api/vendors/unclaimed ─────────────────────────────────────────────
+// Returns pre-populated, unclaimed vendor listings so vendors can find and
+// claim their business. Supports ?q= search and ?country= filter.
+app.get("/api/vendors/unclaimed", async (req, res) => {
+  try {
+    const { q = "", country = "", page = "1", limit = "24" } = req.query;
+    const vendors = await repo.listUnclaimedVendors({
+      q: String(q).trim(),
+      country: String(country).trim(),
+      page: Math.max(1, parseInt(page) || 1),
+      limit: Math.min(48, parseInt(limit) || 24),
+    });
+    res.json({ vendors, total: vendors.length });
+  } catch (e) {
+    console.error("[unclaimed] error:", e.message);
+    res.status(500).json({ error: "Could not load unclaimed listings." });
+  }
+});
 mountCompliance(app, {
   auth, requireVendor, repo,
   sendEmail: async ({ to, subject, html }) => {
