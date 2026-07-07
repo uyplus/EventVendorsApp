@@ -367,6 +367,56 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   res.json(listing);
 }));
 
+
+/* ── TEMP DIAGNOSTIC — remove after messaging is fixed ─────────────────── */
+app.get("/api/debug/messaging", async (req, res) => {
+  const out = { usingPg, steps: [] };
+  try {
+    // Step 1: Can we reach the database?
+    const ping = await query("SELECT 1 AS ok").catch(e => ({ error: e.message }));
+    out.steps.push({ step: "db_ping", result: ping.rows?.[0] || ping });
+
+    // Step 2: Does the threads table exist?
+    const threads = await query("SELECT COUNT(*) AS n FROM threads").catch(e => ({ error: e.message }));
+    out.steps.push({ step: "threads_table", result: threads.rows?.[0] || threads });
+
+    // Step 3: Does thread_messages table exist?
+    const msgs = await query("SELECT COUNT(*) AS n FROM thread_messages").catch(e => ({ error: e.message }));
+    out.steps.push({ step: "thread_messages_table", result: msgs.rows?.[0] || msgs });
+
+    // Step 4: Check threads columns
+    const cols = await query(
+      "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='threads' ORDER BY ordinal_position"
+    ).catch(e => ({ error: e.message }));
+    out.steps.push({ step: "threads_columns", result: cols.rows || cols });
+
+    // Step 5: Check constraints on threads
+    const cons = await query(
+      "SELECT conname, contype FROM pg_constraint WHERE conrelid='threads'::regclass"
+    ).catch(e => ({ error: e.message }));
+    out.steps.push({ step: "threads_constraints", result: cons.rows || cons });
+
+    // Step 6: Try a test INSERT (vendorId=999999, customerId=999999 — won't conflict with real data)
+    const testInsert = await query(
+      "INSERT INTO threads (vendor_id, customer_id, subject, kind) VALUES ($1,$2,$3,$4) RETURNING id",
+      [999999, 999999, "DIAG_TEST", "message"]
+    ).catch(e => ({ error: e.message, code: e.code }));
+    out.steps.push({ step: "test_insert", result: testInsert.rows?.[0] || testInsert });
+
+    // Step 7: Clean up test row
+    if (testInsert.rows?.[0]) {
+      await query("DELETE FROM threads WHERE subject='DIAG_TEST'").catch(() => {});
+      out.steps.push({ step: "cleanup", result: "ok" });
+    }
+
+    res.json(out);
+  } catch (e) {
+    out.error = e.message;
+    res.status(500).json(out);
+  }
+});
+/* ── END TEMP DIAGNOSTIC ────────────────────────────────────────────────── */
+
 /* ── messaging — two-sided: customer ⇄ vendor, one thread per pair ──────── */
 app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), async (req, res) => {
   try {
