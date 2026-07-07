@@ -584,13 +584,13 @@ export const repo = {
     return t ? { id: t.id, vendor_id: t.vendorId, customer_id: t.customerId } : null;
   },
 
-  async getOrCreateThread({ vendorId, customerId, subject, kind, vendorName }) {
+  async getOrCreateThread({ vendorId, customerId, subject, kind }) {
     if (usingPg) {
       const existing = await query(`SELECT * FROM threads WHERE vendor_id=$1 AND customer_id=$2`, [vendorId, customerId]);
       if (existing.rows[0]) return existing.rows[0];
       const r = await query(
-        `INSERT INTO threads (vendor_id, customer_id, subject, kind, vendor_name) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-        [vendorId, customerId, subject || "Enquiry", kind || "message", vendorName || null]);
+        `INSERT INTO threads (vendor_id, customer_id, subject, kind) VALUES ($1,$2,$3,$4) RETURNING *`,
+        [vendorId, customerId, subject || "Enquiry", kind || "message"]);
       return r.rows[0];
     }
     const db = getDb();
@@ -632,7 +632,7 @@ export const repo = {
         out.push({
           id: "th" + t.id, vendorId: t.vendor_id,
           vendorName: t.vendor_name || `Vendor #${t.vendor_id}`,
-          customerName: t.customer_name || `${t.first_name || ""} ${t.last_name || ""}`.trim() || "Customer",
+          customerName: `${t.first_name || ""} ${t.last_name || ""}`.trim() || "Customer",
           subject: t.subject, kind: t.kind,
           unread: msgs.some((m) => !m.read && m.sender_role !== role),
           // "me" must mean "whoever is currently looking at this" — not

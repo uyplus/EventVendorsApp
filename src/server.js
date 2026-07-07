@@ -371,12 +371,7 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
 app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
   const { vendorId, subject, body, kind } = req.body || {};
   if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
-  // Try to get vendor name for display — non-blocking, thread still created even if vendor not found
-  const _vendorForName = await repo.findVendorById(vendorId).catch(() => null);
-  const thread = await repo.getOrCreateThread({
-    vendorId, customerId: req.user.id, subject, kind,
-    vendorName: _vendorForName?.name || null,
-  });
+  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind });
   await repo.addThreadMessage(thread.id, "customer", body);
   // Email the vendor — this is what makes a message actually reach someone
   // instead of just sitting unread in a dashboard inbox they may not check.
