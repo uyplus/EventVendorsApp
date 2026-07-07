@@ -412,6 +412,20 @@ app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, m
 }));
 
 // Mark a thread as read (vendor or customer opens their inbox)
+app.delete("/api/threads/:id", auth, h(async (req, res) => {
+  const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
+  const role = req.user.role === "vendor" ? "vendor" : "customer";
+  // verify the requester is a participant in this thread
+  const thread = await repo.getThreadById(threadId);
+  if (!thread) return res.status(404).json({ error: "Thread not found." });
+  const isParticipant =
+    (role === "customer" && thread.customer_id === req.user.id) ||
+    (role === "vendor"   && thread.vendor_id  !== undefined);
+  if (!isParticipant) return res.status(403).json({ error: "Not authorised." });
+  await repo.deleteThread(threadId, role);
+  res.json({ ok: true });
+}));
+
 app.post("/api/threads/:id/read", auth, h(async (req, res) => {
   const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
   await repo.markThreadRead(threadId, req.user.role);

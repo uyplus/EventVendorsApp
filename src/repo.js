@@ -623,7 +623,10 @@ export const repo = {
          FROM threads t
          LEFT JOIN vendors v ON v.id = t.vendor_id
          LEFT JOIN users u ON u.id = t.customer_id
-         WHERE ${where} ORDER BY t.created_at DESC`, [param])).rows;
+         WHERE ${where}
+         AND (role = 'vendor' OR t.deleted_by_customer = false)
+         AND (role = 'customer' OR t.deleted_by_vendor = false)
+         ORDER BY t.created_at DESC`, [param])).rows;
       const out = [];
       for (const t of threads) {
         const msgs = (await query(`SELECT * FROM thread_messages WHERE thread_id=$1 ORDER BY created_at ASC`, [t.id])).rows;
@@ -653,6 +656,19 @@ export const repo = {
         messages: msgs.map((m) => ({ from: m.senderRole === role ? "me" : m.senderRole, text: m.body, time: m.createdAt })),
       };
     }).sort((a, b) => b.id.localeCompare(a.id));
+  },
+
+  async deleteThread(threadId, role) {
+    if (usingPg) {
+      const col = role === "vendor" ? "deleted_by_vendor" : "deleted_by_customer";
+      await query(`UPDATE threads SET ${col}=true WHERE id=$1`, [threadId]);
+      return;
+    }
+    // in-memory fallback: just remove the thread
+    const db = getDb();
+    db.threads = (db.threads || []).filter((t) => t.id !== threadId);
+    db.threadMessages = (db.threadMessages || []).filter((m) => m.threadId !== threadId);
+    memSave();
   },
 
   async markThreadRead(threadId, role) {
