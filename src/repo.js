@@ -621,8 +621,8 @@ export const repo = {
       const threads = (await query(
         `SELECT t.*, v.name AS vendor_name, u.first_name, u.last_name
          FROM threads t
-         JOIN vendors v ON v.id = t.vendor_id
-         JOIN users u ON u.id = t.customer_id
+         LEFT JOIN vendors v ON v.id = t.vendor_id
+         LEFT JOIN users u ON u.id = t.customer_id
          WHERE ${where} ORDER BY t.created_at DESC`, [param])).rows;
       const out = [];
       for (const t of threads) {

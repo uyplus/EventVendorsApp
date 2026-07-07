@@ -566,3 +566,44 @@ const PORT = process.env.PORT || 4000;
   await ensureSeeded();
   app.listen(PORT, () => console.log(`Event Vendors API running on http://localhost:${PORT}`));
 })().catch((e) => { console.error("Failed to start:", e); process.exit(1); });
+
+// ── POST /api/admin/import-vendors ────────────────────────────────────────────
+// Bulk-import pre-populated vendor records (from Yelp, Google, CSV, etc.)
+// Body: { secret, vendors: [{ name, cat, city, region, country, phone, about,
+//         website, source, sourceId, sourceUrl, hue, rating, reviews }] }
+// IMPORTANT: protect with ADMIN_SECRET env var before going to production.
+app.post("/api/admin/import-vendors", async (req, res) => {
+  const { secret, vendors: batch } = req.body || {};
+  const expectedSecret = process.env.ADMIN_SECRET || "ev-admin-2026";
+  if (secret !== expectedSecret)
+    return res.status(403).json({ error: "Forbidden." });
+  if (!Array.isArray(batch) || batch.length === 0)
+    return res.status(400).json({ error: "Provide a non-empty vendors array." });
+
+  const results = { inserted: 0, skipped: 0, errors: [] };
+  for (const v of batch) {
+    try {
+      const id = await repo.insertPrePopulatedVendor({
+        name:      String(v.name || "").trim(),
+        cat:       String(v.cat  || "mgmt").toLowerCase(),
+        city:      String(v.city || "").trim(),
+        region:    String(v.region || v.state || "").trim(),
+        country:   String(v.country || "United States").trim(),
+        about:     String(v.about || v.pitch || "").slice(0, 280),
+        phone:     String(v.phone || v.businessPhone || "").trim(),
+        website:   String(v.website || "").trim(),
+        source:    String(v.source || "manual"),
+        sourceId:  v.sourceId || null,
+        sourceUrl: v.sourceUrl || v.source_url || null,
+        hue:       Number(v.hue) || Math.floor(Math.random() * 340),
+        rating:    Number(v.rating) || 0,
+        reviews:   Number(v.reviews) || 0,
+      });
+      if (id) results.inserted++;
+      else     results.skipped++;  // ON CONFLICT DO NOTHING (duplicate source_id)
+    } catch (e) {
+      results.errors.push({ name: v.name, error: e.message });
+    }
+  }
+  res.json({ ok: true, ...results });
+});
