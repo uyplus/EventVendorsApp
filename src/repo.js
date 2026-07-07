@@ -624,8 +624,7 @@ export const repo = {
          LEFT JOIN vendors v ON v.id = t.vendor_id
          LEFT JOIN users u ON u.id = t.customer_id
          WHERE ${where}
-         AND (role = 'vendor' OR t.deleted_by_customer = false)
-         AND (role = 'customer' OR t.deleted_by_vendor = false)
+         AND ${role === "vendor" ? "t.deleted_by_vendor = false" : "t.deleted_by_customer = false"}
          ORDER BY t.created_at DESC`, [param])).rows;
       const out = [];
       for (const t of threads) {

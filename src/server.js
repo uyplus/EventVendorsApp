@@ -70,6 +70,20 @@ function sanitizeServices(services) {
 const h = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: "Server error." }); });
 
 /* ── health & taxonomy ─────────────────────────────────────────────────── */
+app.get("/api/health/messaging", h(async (req, res) => {
+  if (!usingPg) return res.json({ mode: "in-memory", tablesExist: true, note: "Using in-memory store — no DB." });
+  try {
+    await query("SELECT 1 FROM threads LIMIT 1");
+    await query("SELECT 1 FROM thread_messages LIMIT 1");
+    const tc = (await query("SELECT COUNT(*) AS n FROM threads")).rows[0].n;
+    const mc = (await query("SELECT COUNT(*) AS n FROM thread_messages")).rows[0].n;
+    res.json({ mode: "postgres", tablesExist: true, threadCount: Number(tc), messageCount: Number(mc) });
+  } catch (e) {
+    res.status(500).json({ mode: "postgres", tablesExist: false, error: e.message,
+      fix: "Run schema_v15.sql in your Supabase SQL Editor." });
+  }
+}));
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
 
