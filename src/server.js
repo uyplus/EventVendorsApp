@@ -368,11 +368,15 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
 }));
 
 /* ── messaging — two-sided: customer ⇄ vendor, one thread per pair ──────── */
-app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
-  const { vendorId, subject, body, kind } = req.body || {};
-  if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
-  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind });
-  await repo.addThreadMessage(thread.id, "customer", body);
+app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), async (req, res) => {
+  try {
+    const { vendorId, subject, body, kind } = req.body || {};
+    if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
+    let thread;
+    try { thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind }); }
+    catch (e1) { return res.status(500).json({ error: "Thread creation failed", detail: e1.message, vendorId, customerId: req.user.id }); }
+    try { await repo.addThreadMessage(thread.id, "customer", body); }
+    catch (e2) { return res.status(500).json({ error: "Message save failed", detail: e2.message, threadId: thread.id }); }
   // Email the vendor — this is what makes a message actually reach someone
   // instead of just sitting unread in a dashboard inbox they may not check.
   (async () => {
@@ -385,8 +389,9 @@ app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 })
       }
     } catch (e) { /* never block the request over a mail failure */ }
   })();
-  res.status(201).json({ ok: true, threadId: "th" + thread.id });
-}));
+    res.status(201).json({ ok: true, threadId: "th" + thread.id });
+  } catch (e) { res.status(500).json({ error: "Unexpected error", detail: e.message }); }
+});
 
 app.get("/api/threads", auth, h(async (req, res) => {
   if (req.user.role === "vendor") {
