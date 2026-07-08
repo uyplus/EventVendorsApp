@@ -617,6 +617,19 @@ export const repo = {
     return t;
   },
 
+  async ensureMessagingTables() {
+    if (!usingPg) return;
+    await query(`CREATE TABLE IF NOT EXISTS thread_messages (
+      id BIGSERIAL PRIMARY KEY,
+      thread_id BIGINT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+      sender_role VARCHAR(10) NOT NULL,
+      body TEXT NOT NULL,
+      read BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`).catch(()=>{});
+    await query('CREATE INDEX IF NOT EXISTS thread_messages_thread_idx ON thread_messages(thread_id)').catch(()=>{});
+  },
+
   async addThreadMessage(threadId, senderRole, body) {
     if (usingPg) {
       const r = await query(

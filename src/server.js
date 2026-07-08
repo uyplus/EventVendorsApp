@@ -233,7 +233,40 @@ app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }), h(
   res.json({ token: signToken(user), user: publicUser(user) });
 }));
 
-app.get("/api/auth/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
+app.get("/api/auth/me", auth, h(async (req, res) => {
+  const user = publicUser(req.user);
+  // For vendors, merge in their listing data so the dashboard edit form pre-populates
+  if (req.user.role === "vendor") {
+    try {
+      const listing = await repo.findVendorByOwner(req.user.id);
+      if (listing) {
+        // Merge all listing fields — these are what the Nn dashboard edit reads
+        Object.assign(user, {
+          about: listing.about, photos: listing.photos || [],
+          services: listing.services || {}, cuisines: listing.cuisines || [],
+          languagesSpoken: listing.languages || [], languages: listing.languages || [],
+          instagramHandle: listing.instagramHandle || null,
+          facebookHandle: listing.facebookHandle || null,
+          tiktokHandle: listing.tiktokHandle || null,
+          operatingHours: listing.operatingHours || null,
+          serviceAreas: listing.serviceAreas || [],
+          startingPrice: listing.startingPrice ?? null,
+          experienceSinceYear: listing.experienceSinceYear ?? null,
+          licensed: !!listing.licensed,
+          licenceFile: listing.licencePath || listing.licenceFile || null,
+          licenceExpiry: listing.licenceExpires || listing.licenceExpiry || null,
+          insuranceFile: listing.insurancePath || listing.insuranceFile || null,
+          priceListPath: listing.priceListPath || null,
+          equipmentHire: !!listing.equipmentHire, fullService: !!listing.fullService,
+          blockedDates: listing.blockedDates || [],
+          businessCity: listing.city, businessRegion: listing.region,
+        });
+      }
+    } catch (e) { console.error("[me] listing merge failed:", e.message); }
+  }
+  res.json({ user });
+}));
+
 
 // Password reset (forgot/reset) lives in features.js, mounted below via
 // mountFeatures() — it already uses securely hashed tokens in a dedicated
@@ -654,6 +687,9 @@ mountAnalytics(app, { rateLimit, query, usingPg, admin });
 const PORT = process.env.PORT || 4000;
 (async () => {
   await repo.init();
+  // Ensure thread_messages table exists (might be missing if schema_v7 was not run)
+  if (repo.ensureMessagingTables) await repo.ensureMessagingTables().catch(e=>console.error("[startup] messaging table check:",e.message));
+
   await ensureSeeded();
   app.listen(PORT, () => console.log(`Event Vendors API running on http://localhost:${PORT}`));
 })().catch((e) => { console.error("Failed to start:", e); process.exit(1); });
