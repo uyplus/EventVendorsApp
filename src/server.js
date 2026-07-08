@@ -360,6 +360,14 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.tiktokHandle !== undefined) patch.tiktokHandle = b.tiktokHandle || null;
   if (b.website !== undefined) patch.website = b.website || null;
   if (b.operatingHours !== undefined) patch.operatingHours = b.operatingHours || null;
+  if (b.city !== undefined) patch.city = b.city || null;
+  if (b.region !== undefined) patch.region = b.region || null;
+  if (b.country !== undefined) patch.country = b.country || null;
+  if (b.licenceFile !== undefined) patch.licenceFile = b.licenceFile || null;
+  if (b.licenceExpiry !== undefined) patch.licenceExpiry = b.licenceExpiry || null;
+  if (b.insuranceFile !== undefined) patch.insuranceFile = b.insuranceFile || null;
+  if (b.insuranceExpiry !== undefined) patch.insuranceExpiry = b.insuranceExpiry || null;
+
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);

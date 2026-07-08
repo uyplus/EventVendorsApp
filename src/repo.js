@@ -432,7 +432,10 @@ export const repo = {
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
              experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
              equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21,
-             operating_hours=$22, website=$23 WHERE id=$1 RETURNING *`,
+             operating_hours=$22, website=$23,
+             city=$24, region=$25, country=$26,
+             licence_file=$27, licence_expiry=$28, insurance_file=$29, insurance_expiry=$30
+             WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
            !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
@@ -441,17 +444,31 @@ export const repo = {
            !!merged.equipmentHire, !!merged.fullService,
            merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null,
            merged.operatingHours ? J(merged.operatingHours) : null,
-           merged.website || null]);
+           merged.website || null,
+           merged.city || null, merged.region || null, merged.country || null,
+           merged.licenceFile || null, merged.licenceExpiry || null,
+           merged.insuranceFile || null, merged.insuranceExpiry || null]);
         return toVendor(r.rows[0]);
       } catch (e) {
         if (!/column .* does not exist/i.test(e.message)) throw e;
         console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql, schema_v6.sql, schema_v12.sql, and schema_v13.sql in Supabase. Falling back. Detail:", e.message);
+        // Fallback: save all original columns (without newer schema_v17 additions)
         const r = await query(
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
-             licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12 WHERE id=$1 RETURNING *`,
+             licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
+             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
+             equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21,
+             operating_hours=$22, website=$23, city=$24, region=$25, country=$26
+             WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
-           !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || [])]);
+           !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
+           merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
+           merged.startingPrice === undefined ? null : merged.startingPrice,
+           !!merged.equipmentHire, !!merged.fullService,
+           merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null,
+           merged.operatingHours ? J(merged.operatingHours) : null, merged.website || null,
+           merged.city || null, merged.region || null, merged.country || null]);
         return toVendor(r.rows[0]);
       }
     }
@@ -624,7 +641,6 @@ export const repo = {
          LEFT JOIN vendors v ON v.id = t.vendor_id
          LEFT JOIN users u ON u.id = t.customer_id
          WHERE ${where}
-         AND ${role === "vendor" ? "t.deleted_by_vendor = false" : "t.deleted_by_customer = false"}
          ORDER BY t.created_at DESC`, [param])).rows;
       const out = [];
       for (const t of threads) {
