@@ -84,6 +84,8 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
+app.get("/api/version", (req,res)=>res.json({version:"v243-2026-07-10",fixes:["messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
 
