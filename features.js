@@ -101,18 +101,7 @@ export function mountFeatures(app, { auth, requireVendor, repo }) {
     }
     res.json(out);
   }));
-  app.post("/api/messages", auth, wrap(async (req, res) => {
-    const { vendorId, subject, body } = req.body || {};
-    if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
-    if (!usingPg) return res.status(201).json({ ok: true });
-    let t = (await query("SELECT id FROM threads WHERE customer_user_id=$1 AND vendor_id=$2 LIMIT 1", [req.user.id, vendorId])).rows[0];
-    const threadId = t ? Number(t.id) : Number((await query("INSERT INTO threads (customer_user_id,vendor_id,subject) VALUES ($1,$2,$3) RETURNING id", [req.user.id, vendorId, subject || "Enquiry"])).rows[0].id);
-    await query("INSERT INTO messages (thread_id,sender,body) VALUES ($1,'customer',$2)", [threadId, body]);
-    await query("UPDATE threads SET vendor_unread=TRUE, updated_at=now() WHERE id=$1", [threadId]);
-    const v = (await query("SELECT owner_user_id FROM vendors WHERE id=$1", [vendorId])).rows[0];
-    if (v) await notify(Number(v.owner_user_id), "New message from a customer.");
-    res.status(201).json({ ok: true, threadId });
-  }));
+  // /api/messages now handled by server.js (v234+)
   app.post("/api/threads/:id/reply", auth, wrap(async (req, res) => {
     if (!usingPg) return res.json({ ok: true });
     const r = role(req.user);
