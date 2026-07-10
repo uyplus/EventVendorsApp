@@ -20,6 +20,7 @@ const toVendor = (r) => r && ({
   name: r.name, cat: r.cat, offering: r.offering, price: r.price, startingPrice: r.starting_price,
   city: r.city, region: r.region, country: r.country, distance: r.distance,
   rating: Number(r.rating), reviews: r.reviews, premium: r.premium, sponsored: r.sponsored,
+  thumbsUp: r.thumbs_up || 0, thumbsDown: r.thumbs_down || 0,
   premiumTier: r.premium_tier || null,
   premiumSince: r.premium_since || null,
   premiumExpiresAt: r.premium_expires_at || null,
@@ -41,6 +42,15 @@ const toVendor = (r) => r && ({
   experienceSinceYear: r.experience_since_year ?? null,
   serviceAreas: r.service_areas || [],
   priceListPath: r.price_list_path || null,
+  instagramHandle: r.instagram_handle || null,
+  facebookHandle: r.facebook_handle || null, tiktokHandle: r.tiktok_handle || null,
+  operatingHours: r.operating_hours || null,
+  // claim-your-profile fields
+  claimed: r.claimed ?? true,
+  prePopulated: r.pre_populated ?? false,
+  sourceUrl: r.source_url || null,
+  website: r.website || null,
+  claimTokenExpires: r.claim_token_expires || null,
 });
 const toReport = (r) => r && ({
   id: Number(r.id), vendorId: r.vendor_id == null ? null : Number(r.vendor_id),
@@ -87,15 +97,24 @@ export const repo = {
     return getDb().users.find((u) => String(u.id) === String(id)) || null;
   },
 
+  // Password reset lives in features.js (password_reset_tokens table,
+  // hashed tokens) — that's the real, working implementation. A duplicate
+  // pair of methods used to live here too; removed for the same reason
+  // the duplicate routes were removed from server.js.
+
   async listUsers() {
     if (usingPg) return (await query("SELECT * FROM users ORDER BY id")).rows.map(toUser);
     return getDb().users.slice();
   },
 
   async verifyEmail(token) {
-    if (usingPg) return (await query("UPDATE users SET verified=TRUE, email_token=NULL WHERE email_token=$1 RETURNING id", [token])).rowCount > 0;
+    if (usingPg) {
+      const r = await query("UPDATE users SET verified=TRUE, email_token=NULL WHERE email_token=$1 RETURNING id", [token]);
+      return r.rows[0]?.id || null;
+    }
     const u = getDb().users.find((x) => x.emailToken && x.emailToken === token);
-    if (!u) return false; u.verified = true; u.emailToken = null; memSave(); return true;
+    if (!u) return null;
+    u.verified = true; u.emailToken = null; memSave(); return u.id;
   },
 
   async setUserSuspended(id, val) {
@@ -206,8 +225,98 @@ export const repo = {
     return getDb().vendors.filter((v) => v.premiumTier === "founding").length;
   },
 
+  /* ── reviews — real, persisted; vendor rating/count recompute live ────── */
+
+  async createReview(vendorId, customerId, authorName, rating, body, thumbs) {
+    if (usingPg) {
+      try {
+        await query(
+          `INSERT INTO reviews (vendor_id, customer_id, author_name, rating, body, thumbs) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [vendorId, customerId || null, authorName || "Guest", rating, body || "", thumbs || null]);
+        // Recompute the vendor's aggregate rating/count/thumbs from real reviews —
+        // this is what makes the counters genuinely live, not frozen seed numbers.
+        const agg = await query(`SELECT COUNT(*)::int AS n, AVG(rating)::numeric(3,2) AS avg,
+          COUNT(*) FILTER (WHERE thumbs='up')::int AS up, COUNT(*) FILTER (WHERE thumbs='down')::int AS down
+          FROM reviews WHERE vendor_id=$1`, [vendorId]);
+        const { n, avg, up, down } = agg.rows[0];
+        await query(`UPDATE vendors SET reviews=$2, rating=$3, thumbs_up=$4, thumbs_down=$5 WHERE id=$1`, [vendorId, n, avg, up, down]);
+        return { count: n, rating: parseFloat(avg), thumbsUp: up, thumbsDown: down };
+      } catch (e) {
+        if (!/relation .* does not exist/i.test(e.message) && !/column .* does not exist/i.test(e.message)) throw e;
+        console.error("[repo] createReview: reviews table/columns missing — run schema_v9.sql and schema_v10.sql in Supabase. Review was not saved. Detail:", e.message);
+        return null;
+      }
+    }
+    const db = getDb();
+    db.reviews = db.reviews || [];
+    db.reviews.push({ id: nextId("review"), vendorId, customerId: customerId || null, authorName: authorName || "Guest", rating, body: body || "", thumbs: thumbs || null, createdAt: new Date().toISOString() });
+    const mine = db.reviews.filter((r) => r.vendorId === vendorId);
+    const avg = mine.reduce((s, r) => s + r.rating, 0) / mine.length;
+    const up = mine.filter((r) => r.thumbs === "up").length;
+    const down = mine.filter((r) => r.thumbs === "down").length;
+    const v = db.vendors.find((x) => x.id === vendorId);
+    if (v) { v.reviews = mine.length; v.rating = Math.round(avg * 100) / 100; v.thumbsUp = up; v.thumbsDown = down; }
+    memSave();
+    return { count: mine.length, rating: Math.round(avg * 100) / 100, thumbsUp: up, thumbsDown: down };
+  },
+
+  async listReviewsForVendor(vendorId) {
+    if (usingPg) {
+      try {
+        const r = await query(`SELECT * FROM reviews WHERE vendor_id=$1 ORDER BY created_at DESC`, [vendorId]);
+        return r.rows.map((x) => ({ author: x.author_name, rating: x.rating, text: x.body, date: new Date(x.created_at).toLocaleDateString(), thumbs: x.thumbs || null }));
+      } catch (e) { return []; }
+    }
+    const db = getDb();
+    return (db.reviews || []).filter((r) => r.vendorId === vendorId)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .map((r) => ({ author: r.authorName, rating: r.rating, text: r.body, date: new Date(r.createdAt).toLocaleDateString(), thumbs: r.thumbs || null }));
+  },
+
+  /* ── response time — computed from real message timestamps ────────────
+     For each thread, time from the customer's first message to the
+     vendor's first reply after it, averaged across all threads with a
+     reply. This is a genuine measurement, not an estimate or a default. */
+  async getVendorResponseStats(vendorId) {
+    if (usingPg) {
+      try {
+        const r = await query(`
+          WITH first_customer AS (
+            SELECT t.id AS thread_id, MIN(m.created_at) AS at
+            FROM threads t JOIN thread_messages m ON m.thread_id = t.id
+            WHERE t.vendor_id = $1 AND m.sender_role = 'customer'
+            GROUP BY t.id
+          ),
+          first_reply AS (
+            SELECT fc.thread_id, MIN(m.created_at) AS at
+            FROM first_customer fc
+            JOIN thread_messages m ON m.thread_id = fc.thread_id AND m.sender_role = 'vendor' AND m.created_at > fc.at
+            GROUP BY fc.thread_id
+          )
+          SELECT AVG(EXTRACT(EPOCH FROM (fr.at - fc.at)))::int AS avg_seconds, COUNT(*)::int AS n
+          FROM first_customer fc JOIN first_reply fr ON fr.thread_id = fc.thread_id`, [vendorId]);
+        const { avg_seconds, n } = r.rows[0];
+        return { avgMinutes: avg_seconds != null ? Math.round(avg_seconds / 60) : null, sampleSize: n || 0 };
+      } catch (e) { return { avgMinutes: null, sampleSize: 0 }; }
+    }
+    const db = getDb();
+    const myThreads = (db.threads || []).filter((t) => t.vendorId === Number(vendorId));
+    let total = 0, count = 0;
+    for (const t of myThreads) {
+      const msgs = (db.threadMessages || []).filter((m) => m.threadId === t.id).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+      const firstCustomer = msgs.find((m) => m.senderRole === "customer");
+      if (!firstCustomer) continue;
+      const reply = msgs.find((m) => m.senderRole === "vendor" && new Date(m.createdAt) > new Date(firstCustomer.createdAt));
+      if (!reply) continue;
+      total += (new Date(reply.createdAt) - new Date(firstCustomer.createdAt)) / 60000;
+      count++;
+    }
+    return { avgMinutes: count ? Math.round(total / count) : null, sampleSize: count };
+  },
+
   /* ── vendors ────────────────────────────────────────────────────────── */
   async createVendor(v) {
+    let vendor;
     if (usingPg) {
       try {
         const r = await query(
@@ -220,7 +329,7 @@ export const repo = {
            J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
            v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3,
            v.experienceSinceYear ?? null, J(v.serviceAreas || []), v.priceListPath || null]);
-        return toVendor(r.rows[0]);
+        vendor = toVendor(r.rows[0]);
       } catch (e) {
         // Defensive fallback: if experience_since_year / service_areas / price_list_path
         // don't exist yet (schema_v5.sql / schema_v6.sql not run), don't let a brand new
@@ -237,11 +346,36 @@ export const repo = {
            v.fullService === undefined ? true : !!v.fullService, v.years ?? 0, J(v.languages || ["English"]),
            J(v.cuisines ?? null), J(v.services || {}), J(v.photos || []), v.about || "", v.pitch || "",
            v.businessAddress || "", v.businessPhone || "", v.hue ?? 200, v.maxPhotos ?? 3]);
-        return toVendor(r.rows[0]);
+        vendor = toVendor(r.rows[0]);
       }
+      // Social handles, set via a separate isolated update rather than baked
+      // into the INSERT above — keeps that already-complex statement
+      // untouched, and means a missing schema_v12.sql just skips this
+      // instead of risking the vendor record itself.
+      if (v.instagramHandle || v.facebookHandle || v.tiktokHandle) {
+        try {
+          await query(`UPDATE vendors SET instagram_handle=$2, facebook_handle=$3, tiktok_handle=$4 WHERE id=$1`,
+            [vendor.id, v.instagramHandle || null, v.facebookHandle || null, v.tiktokHandle || null]);
+          vendor.instagramHandle = v.instagramHandle || null; vendor.facebookHandle = v.facebookHandle || null; vendor.tiktokHandle = v.tiktokHandle || null;
+        } catch (e) {
+          if (!/column .* does not exist/i.test(e.message)) throw e;
+          console.error("[repo] createVendor: social handle columns missing — run schema_v12.sql in Supabase. Skipped.", e.message);
+        }
+      }
+      // Same isolated-update pattern for operating hours.
+      if (v.operatingHours) {
+        try {
+          await query(`UPDATE vendors SET operating_hours=$2 WHERE id=$1`, [vendor.id, J(v.operatingHours)]);
+          vendor.operatingHours = v.operatingHours;
+        } catch (e) {
+          if (!/column .* does not exist/i.test(e.message)) throw e;
+          console.error("[repo] createVendor: operating_hours column missing — run schema_v13.sql in Supabase. Skipped.", e.message);
+        }
+      }
+      return vendor;
     }
     const db = getDb();
-    const vendor = { id: nextId("vendor"), ownerUserId: v.ownerUserId ?? null, name: v.name || "",
+    vendor = { id: nextId("vendor"), ownerUserId: v.ownerUserId ?? null, name: v.name || "",
       cat: v.cat || "mgmt", offering: v.offering || "", price: v.price ?? 2,
       startingPrice: v.startingPrice === undefined ? 0 : v.startingPrice, // preserve explicit null (N/A) — only default when truly unset
       city: v.city || "", region: v.region || "", country: v.country || "US", distance: v.distance ?? 0,
@@ -252,7 +386,9 @@ export const repo = {
       services: v.services || {}, photos: v.photos || [], blockedDates: [], about: v.about || "",
       pitch: v.pitch || "", businessAddress: v.businessAddress || "", businessPhone: v.businessPhone || "",
       hue: v.hue ?? 200, maxPhotos: v.maxPhotos ?? 3, createdAt: new Date().toISOString(),
-      experienceSinceYear: v.experienceSinceYear ?? null, serviceAreas: v.serviceAreas || [], priceListPath: v.priceListPath || null };
+      experienceSinceYear: v.experienceSinceYear ?? null, serviceAreas: v.serviceAreas || [], priceListPath: v.priceListPath || null,
+      instagramHandle: v.instagramHandle || null, facebookHandle: v.facebookHandle || null, tiktokHandle: v.tiktokHandle || null,
+      operatingHours: v.operatingHours || null };
     db.vendors.push(vendor); memSave(); return vendor;
   },
 
@@ -294,22 +430,45 @@ export const repo = {
         const r = await query(
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
              licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
-             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16 WHERE id=$1 RETURNING *`,
+             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
+             equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21,
+             operating_hours=$22, website=$23,
+             city=$24, region=$25, country=$26,
+             licence_file=$27, licence_expiry=$28, insurance_file=$29, insurance_expiry=$30
+             WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
            !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
            merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
-           merged.startingPrice === undefined ? null : merged.startingPrice]);
+           merged.startingPrice === undefined ? null : merged.startingPrice,
+           !!merged.equipmentHire, !!merged.fullService,
+           merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null,
+           merged.operatingHours ? J(merged.operatingHours) : null,
+           merged.website || null,
+           merged.city || null, merged.region || null, merged.country || null,
+           merged.licenceFile || null, merged.licenceExpiry || null,
+           merged.insuranceFile || null, merged.insuranceExpiry || null]);
         return toVendor(r.rows[0]);
       } catch (e) {
         if (!/column .* does not exist/i.test(e.message)) throw e;
-        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql and schema_v6.sql in Supabase. Falling back. Detail:", e.message);
+        console.error("[repo] updateVendorByOwner: newer columns missing — run schema_v5.sql, schema_v6.sql, schema_v12.sql, and schema_v13.sql in Supabase. Falling back. Detail:", e.message);
+        // Fallback: save all original columns (without newer schema_v17 additions)
         const r = await query(
           `UPDATE vendors SET name=$2, about=$3, services=$4, cuisines=$5, languages=$6, blocked_dates=$7,
-             licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12 WHERE id=$1 RETURNING *`,
+             licensed=$8, plan=$9, sponsored=$10, max_photos=$11, photos=$12,
+             experience_since_year=$13, service_areas=$14, price_list_path=$15, starting_price=$16,
+             equipment_hire=$17, full_service=$18, instagram_handle=$19, facebook_handle=$20, tiktok_handle=$21,
+             operating_hours=$22, website=$23, city=$24, region=$25, country=$26
+             WHERE id=$1 RETURNING *`,
           [listing.id, merged.name || "", merged.about || "", J(merged.services || {}), J(merged.cuisines ?? null),
            J(merged.languages || []), J(merged.blockedDates || []), !!merged.licensed, merged.plan || "free",
-           !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || [])]);
+           !!merged.sponsored, merged.maxPhotos ?? 3, J(merged.photos || []),
+           merged.experienceSinceYear ?? null, J(merged.serviceAreas || []), merged.priceListPath || null,
+           merged.startingPrice === undefined ? null : merged.startingPrice,
+           !!merged.equipmentHire, !!merged.fullService,
+           merged.instagramHandle || null, merged.facebookHandle || null, merged.tiktokHandle || null,
+           merged.operatingHours ? J(merged.operatingHours) : null, merged.website || null,
+           merged.city || null, merged.region || null, merged.country || null]);
         return toVendor(r.rows[0]);
       }
     }
@@ -435,6 +594,13 @@ export const repo = {
 
   // ── messaging (two-sided: a thread links one customer + one vendor) ──────
 
+  async getThreadById(threadId) {
+    if (usingPg) return (await query("SELECT * FROM threads WHERE id=$1", [threadId])).rows[0] || null;
+    const db = getDb();
+    const t = (db.threads || []).find((x) => x.id === threadId);
+    return t ? { id: t.id, vendor_id: t.vendorId, customer_id: t.customerId } : null;
+  },
+
   async getOrCreateThread({ vendorId, customerId, subject, kind }) {
     if (usingPg) {
       const existing = await query(`SELECT * FROM threads WHERE vendor_id=$1 AND customer_id=$2`, [vendorId, customerId]);
@@ -449,6 +615,19 @@ export const repo = {
     let t = db.threads.find((x) => x.vendorId === vendorId && x.customerId === customerId);
     if (!t) { t = { id: nextId("thread"), vendorId, customerId, subject: subject || "Enquiry", kind: kind || "message", createdAt: new Date().toISOString() }; db.threads.push(t); memSave(); }
     return t;
+  },
+
+  async ensureMessagingTables() {
+    if (!usingPg) return;
+    await query(`CREATE TABLE IF NOT EXISTS thread_messages (
+      id BIGSERIAL PRIMARY KEY,
+      thread_id BIGINT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+      sender_role VARCHAR(10) NOT NULL,
+      body TEXT NOT NULL,
+      read BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`).catch(()=>{});
+    await query('CREATE INDEX IF NOT EXISTS thread_messages_thread_idx ON thread_messages(thread_id)').catch(()=>{});
   },
 
   async addThreadMessage(threadId, senderRole, body) {
@@ -472,17 +651,23 @@ export const repo = {
       const threads = (await query(
         `SELECT t.*, v.name AS vendor_name, u.first_name, u.last_name
          FROM threads t
-         JOIN vendors v ON v.id = t.vendor_id
-         JOIN users u ON u.id = t.customer_id
-         WHERE ${where} ORDER BY t.created_at DESC`, [param])).rows;
+         LEFT JOIN vendors v ON v.id = t.vendor_id
+         LEFT JOIN users u ON u.id = t.customer_id
+         WHERE ${where}
+         ORDER BY t.created_at DESC`, [param])).rows;
       const out = [];
       for (const t of threads) {
         const msgs = (await query(`SELECT * FROM thread_messages WHERE thread_id=$1 ORDER BY created_at ASC`, [t.id])).rows;
         out.push({
-          id: "th" + t.id, vendorId: t.vendor_id, vendorName: t.vendor_name,
-          customerName: `${t.first_name || ""} ${t.last_name || ""}`.trim(), subject: t.subject, kind: t.kind,
+          id: "th" + t.id, vendorId: t.vendor_id,
+          vendorName: t.vendor_name || `Vendor #${t.vendor_id}`,
+          customerName: `${t.first_name || ""} ${t.last_name || ""}`.trim() || "Customer",
+          subject: t.subject, kind: t.kind,
           unread: msgs.some((m) => !m.read && m.sender_role !== role),
-          messages: msgs.map((m) => ({ from: m.sender_role === "vendor" ? "vendor" : "me", text: m.body, time: m.created_at })),
+          // "me" must mean "whoever is currently looking at this" — not
+          // hardcoded to one side. A vendor viewing their own inbox needs
+          // their own replies to render as "me", not as the other party.
+          messages: msgs.map((m) => ({ from: m.sender_role === role ? "me" : m.sender_role, text: m.body, time: m.created_at })),
         });
       }
       return out;
@@ -498,9 +683,22 @@ export const repo = {
         customerName: customer ? `${customer.firstName || ""} ${customer.lastName || ""}`.trim() : "Customer",
         subject: t.subject, kind: t.kind,
         unread: msgs.some((m) => !m.read && m.senderRole !== role),
-        messages: msgs.map((m) => ({ from: m.senderRole === "vendor" ? "vendor" : "me", text: m.body, time: m.createdAt })),
+        messages: msgs.map((m) => ({ from: m.senderRole === role ? "me" : m.senderRole, text: m.body, time: m.createdAt })),
       };
     }).sort((a, b) => b.id.localeCompare(a.id));
+  },
+
+  async deleteThread(threadId, role) {
+    if (usingPg) {
+      const col = role === "vendor" ? "deleted_by_vendor" : "deleted_by_customer";
+      await query(`UPDATE threads SET ${col}=true WHERE id=$1`, [threadId]);
+      return;
+    }
+    // in-memory fallback: just remove the thread
+    const db = getDb();
+    db.threads = (db.threads || []).filter((t) => t.id !== threadId);
+    db.threadMessages = (db.threadMessages || []).filter((m) => m.threadId !== threadId);
+    memSave();
   },
 
   async markThreadRead(threadId, role) {
@@ -548,5 +746,154 @@ export const repo = {
     const db = getDb();
     return (db.bookings || []).filter((b) => b.customerId === customerId)
       .map((b) => { const v = (db.vendors || []).find((x) => x.id === b.vendorId); return { id: "bk" + b.id, vendorId: b.vendorId, vendorName: v?.name, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }; });
+  },
+
+  // Cancelling sets status rather than deleting — keeps a record, and frees
+  // the customer to immediately book a new date with the same or another
+  // vendor. Verifies the booking actually belongs to this customer first.
+  async cancelBooking(bookingId, customerId) {
+    const rawId = String(bookingId).replace(/^bk/, "");
+    if (usingPg) {
+      const r = await query(`UPDATE bookings SET status='cancelled' WHERE id=$1 AND customer_id=$2 RETURNING id`, [rawId, customerId]);
+      return r.rowCount > 0;
+    }
+    const db = getDb();
+    const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && x.customerId === customerId);
+    if (!b) return false;
+    b.status = "cancelled"; memSave(); return true;
+  },
+
+  /* ── claim-your-profile ─────────────────────────────────────────────── */
+
+  // Look up an unclaimed vendor by its single-use claim token.
+  async findVendorByClaimToken(token) {
+    if (!token) return null;
+    if (usingPg) {
+      const r = await query(
+        `SELECT *, claim_token_expires AS "claimTokenExpires" FROM vendors WHERE claim_token = $1 LIMIT 1`,
+        [token]
+      );
+      return r.rows[0] ? toVendor({ ...r.rows[0], claimTokenExpires: r.rows[0].claimTokenExpires }) : null;
+    }
+    return (getDb().vendors || []).find((v) => v.claimToken === token) || null;
+  },
+
+  // Persist a fresh claim token + expiry on a pre-populated vendor so we can
+  // send it in the claim email. Safe to call multiple times (overwrites).
+  async setClaimToken(vendorId, token, expiresIso) {
+    if (usingPg) {
+      await query(
+        `UPDATE vendors SET claim_token = $2, claim_token_expires = $3 WHERE id = $1`,
+        [vendorId, token, expiresIso]
+      );
+      return;
+    }
+    const v = (getDb().vendors || []).find((x) => String(x.id) === String(vendorId));
+    if (v) { v.claimToken = token; v.claimTokenExpires = expiresIso; memSave(); }
+  },
+
+  // Transfer ownership once the vendor has created their account via the claim link.
+  async claimVendor(vendorId, userId, _usedToken) {
+    if (usingPg) {
+      await query(
+        `UPDATE vendors
+            SET owner_user_id        = $2,
+                claimed              = true,
+                claim_token          = NULL,
+                claim_token_expires  = NULL
+          WHERE id = $1`,
+        [vendorId, userId]
+      );
+      return;
+    }
+    const v = (getDb().vendors || []).find((x) => String(x.id) === String(vendorId));
+    if (v) {
+      v.ownerUserId = userId; v.claimed = true;
+      v.claimToken = null; v.claimTokenExpires = null;
+      memSave();
+    }
+  },
+
+  // Insert a vendor row sourced from an external scraper (Google / Yelp / CSV).
+  // Returns null (silently) if source_id already exists — idempotent scraping.
+  async insertPrePopulatedVendor(v) {
+    if (usingPg) {
+      try {
+        const r = await query(
+          `INSERT INTO vendors
+             (name, cat, city, region, country,
+              about, business_phone, website,
+              hue, plan, languages, photos, offering, services,
+              pre_populated, claimed, source, source_id, source_url,
+              claim_token, claim_token_expires,
+              rating, reviews, max_photos, price, starting_price,
+              full_service, years, service_areas)
+           VALUES
+             ($1,$2,$3,$4,$5,
+              $6,$7,$8,
+              $9,$10,$11,$12,$13,$14,
+              true,false,$15,$16,$17,
+              $18,$19,
+              $20,$21,$22,$23,$24,
+              true,0,'{}')
+           ON CONFLICT (source_id)
+             WHERE source_id IS NOT NULL
+             DO NOTHING
+           RETURNING id`,
+          [
+            v.name, v.cat || "eventmgmt", v.city || "", v.region || "", v.country || "US",
+            v.about || "", v.phone || "", v.website || "",
+            v.hue ?? 220, "free",
+            J(["English"]), J(v.photos || []), "", J({}),
+            v.source || "manual", v.sourceId || null, v.sourceUrl || null,
+            v.claimToken, v.claimTokenExpires,
+            v.rating ?? 0, v.reviews ?? 0, 10, 2, 0,
+          ]
+        );
+        return r.rows[0]?.id ?? null;
+      } catch (e) {
+        // If schema_v14 hasn't been run yet, skip gracefully
+        if (/column .* does not exist/i.test(e.message)) {
+          console.warn("[repo] insertPrePopulatedVendor: run schema_v14.sql first.", e.message);
+          return null;
+        }
+        throw e;
+      }
+    }
+    // In-memory fallback: just push (no dedup by source_id for local dev)
+    const db = getDb();
+    if ((db.vendors || []).some((x) => x.sourceId && x.sourceId === v.sourceId)) return null;
+    const vendor = { id: nextId("vendor"), claimed: false, prePopulated: true, ...v, createdAt: new Date().toISOString() };
+    db.vendors = db.vendors || [];
+    db.vendors.push(vendor); memSave();
+    return vendor.id;
+  },
+
+  async listUnclaimedVendors({ q = "", country = "", page = 1, limit = 24 }) {
+    try {
+      if (!usingPg()) {
+        const db = getDb();
+        const all = (db.vendors || []).filter(v => v.prePopulated && !v.claimed);
+        const filtered = q
+          ? all.filter(v =>
+              (v.name||"").toLowerCase().includes(q.toLowerCase()) ||
+              (v.city||"").toLowerCase().includes(q.toLowerCase()))
+          : all;
+        const countryed = country ? filtered.filter(v => v.country===country) : filtered;
+        return countryed.slice((page-1)*limit, page*limit).map(toVendor);
+      }
+      const offset = (page - 1) * limit;
+      const term = q ? `%${q}%` : "%";
+      const params = [term, limit, offset];
+      let sql = `SELECT * FROM vendors WHERE pre_populated = true AND (claimed = false OR claimed IS NULL)
+                 AND (name ILIKE $1 OR city ILIKE $1 OR about ILIKE $1)`;
+      if (country) { sql += ` AND country = $${params.length+1}`; params.push(country); }
+      sql += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+      const result = await query(sql, params);
+      return result.rows.map(toVendor);
+    } catch (e) {
+      console.error("[repo] listUnclaimedVendors:", e.message);
+      return [];
+    }
   },
 };
