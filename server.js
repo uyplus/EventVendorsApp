@@ -9,11 +9,17 @@ import { countries, statesOf, citiesOf, source as geoSource } from "./locations.
 import { billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } from "./billing.js";
 import { mountFeatures } from "./features.js";
 import { mountMedia } from "./media.js";
+import { mountClaim } from "./claim.js";
 import { mountCompliance } from "./compliance.js";
 import { mountChat } from "./chat.js";
 import { mountAnalytics } from "./analytics.js";
-import { sendLicenceVerifiedEmail, sendLicenceRejectedEmail } from "./email.js";
-import { sendVerifyEmail, sendContactEmail, sendReportNotificationEmail } from "./email.js";
+import {
+  sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail,
+  sendContactEmail, sendReportNotificationEmail,
+  sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
+  sendClaimEmail,
+} from "./email.js";
+const emailModule = { sendClaimEmail };
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
 
@@ -64,6 +70,22 @@ function sanitizeServices(services) {
 const h = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: "Server error." }); });
 
 /* ── health & taxonomy ─────────────────────────────────────────────────── */
+app.get("/api/health/messaging", h(async (req, res) => {
+  if (!usingPg) return res.json({ mode: "in-memory", tablesExist: true, note: "Using in-memory store — no DB." });
+  try {
+    await query("SELECT 1 FROM threads LIMIT 1");
+    await query("SELECT 1 FROM thread_messages LIMIT 1");
+    const tc = (await query("SELECT COUNT(*) AS n FROM threads")).rows[0].n;
+    const mc = (await query("SELECT COUNT(*) AS n FROM thread_messages")).rows[0].n;
+    res.json({ mode: "postgres", tablesExist: true, threadCount: Number(tc), messageCount: Number(mc) });
+  } catch (e) {
+    res.status(500).json({ mode: "postgres", tablesExist: false, error: e.message,
+      fix: "Run schema_v15.sql in your Supabase SQL Editor." });
+  }
+}));
+
+app.get("/api/version", (req,res)=>res.json({version:"v243-2026-07-10",fixes:["messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
 
@@ -150,12 +172,14 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
       cat: firstCat || "mgmt", offering: firstOffering || "Full event planning",
       price: 2, startingPrice: b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null),
       city: user.city, region: user.state, country: user.country || "US",
-      licensed: !!b.licensed, fullService: true,
+      licensed: !!b.licensed, equipmentHire: !!b.equipmentHire, fullService: !!b.fullService,
       languages: Array.isArray(b.languagesSpoken) && b.languagesSpoken.length ? b.languagesSpoken : ["English"],
       about: b.pitch || "", pitch: b.pitch || "", businessAddress: b.businessAddress || "", businessPhone: b.businessPhone || "",
       cuisines: b.cuisines && b.cuisines.length ? b.cuisines : null, services, hue: 200,
       experienceSinceYear: b.experienceSinceYear ?? null,
       serviceAreas: Array.isArray(b.serviceAreas) ? b.serviceAreas : [],
+      instagramHandle: b.instagramHandle || null, facebookHandle: b.facebookHandle || null, tiktokHandle: b.tiktokHandle || null,
+      operatingHours: b.operatingHours || null,
     });
     // Founding-vendor perk: first 100 real signups get Premium, free, no expiry.
     // Isolated from vendor creation itself — if this fails (e.g. schema_v8.sql
@@ -168,14 +192,22 @@ app.post("/api/auth/signup", rateLimit({ windowMs: 60 * 60 * 1000, max: 8 }), h(
   // Send a registration confirmation / verification email with an activation link.
   // No-throw: a mail failure never blocks signup.
   const verifyLink = `${APP_URL}/?verify=${emailToken}`;
-  sendVerifyEmail(email, verifyLink).catch(() => {});
+  sendVerifyEmail(email, verifyLink, user.firstName).catch(() => {});
+  sendWelcomeEmail(email, user.firstName, role).catch(() => {});
   res.status(201).json({ token: signToken(user), user: publicUser(user) });
 }));
 
 app.get("/api/auth/verify", h(async (req, res) => {
-  const ok = await repo.verifyEmail(req.query.token);
-  if (!ok) return res.status(400).json({ error: "Invalid or expired verification link." });
-  res.json({ ok: true, verified: true });
+  const userId = await repo.verifyEmail(req.query.token);
+  if (!userId) return res.status(400).json({ error: "Invalid or expired verification link." });
+  // Clicking an email link often opens in an isolated in-app browser
+  // (Gmail/Outlook's own preview webview), a separate storage context from
+  // wherever someone was actually logged in — which looks exactly like
+  // being logged out, even though nothing was actually cleared. Issuing a
+  // fresh session here means verifying actively logs you in, in whichever
+  // context the link happens to open, instead of leaving that to chance.
+  const user = await repo.findUserById(userId);
+  res.json({ ok: true, verified: true, token: user ? signToken(user) : null, user: user ? publicUser(user) : null });
 }));
 
 // Contact form (public, rate-limited) → emails the team inbox.
@@ -193,10 +225,56 @@ app.post("/api/auth/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }), h(
   if (!user || !checkPassword(req.body?.password || "", user.passwordHash))
     return res.status(401).json({ error: "Invalid email or password." });
   if (user.suspended) return res.status(403).json({ error: "This account has been suspended." });
+  // Each email is tied to exactly one role at signup — reject a mismatched
+  // login explicitly instead of silently logging them into their real role
+  // regardless of which toggle was selected, which just looks confusing.
+  const requestedRole = req.body?.role === "vendor" ? "vendor" : "customer";
+  if (requestedRole !== user.role) {
+    return res.status(403).json({ error: `This email is registered as a ${user.role}. Please select "I'm a ${user.role}" to log in.`, actualRole: user.role });
+  }
   res.json({ token: signToken(user), user: publicUser(user) });
 }));
 
-app.get("/api/auth/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
+app.get("/api/auth/me", auth, h(async (req, res) => {
+  const user = publicUser(req.user);
+  // For vendors, merge in their listing data so the dashboard edit form pre-populates
+  if (req.user.role === "vendor") {
+    try {
+      const listing = await repo.findVendorByOwner(req.user.id);
+      if (listing) {
+        // Merge all listing fields — these are what the Nn dashboard edit reads
+        Object.assign(user, {
+          about: listing.about, photos: listing.photos || [],
+          services: listing.services || {}, cuisines: listing.cuisines || [],
+          languagesSpoken: listing.languages || [], languages: listing.languages || [],
+          instagramHandle: listing.instagramHandle || null,
+          facebookHandle: listing.facebookHandle || null,
+          tiktokHandle: listing.tiktokHandle || null,
+          operatingHours: listing.operatingHours || null,
+          serviceAreas: listing.serviceAreas || [],
+          startingPrice: listing.startingPrice ?? null,
+          experienceSinceYear: listing.experienceSinceYear ?? null,
+          licensed: !!listing.licensed,
+          licenceFile: listing.licencePath || listing.licenceFile || null,
+          licenceExpiry: listing.licenceExpires || listing.licenceExpiry || null,
+          insuranceFile: listing.insurancePath || listing.insuranceFile || null,
+          priceListPath: listing.priceListPath || null,
+          equipmentHire: !!listing.equipmentHire, fullService: !!listing.fullService,
+          blockedDates: listing.blockedDates || [],
+          businessCity: listing.city, businessRegion: listing.region,
+        });
+      }
+    } catch (e) { console.error("[me] listing merge failed:", e.message); }
+  }
+  res.json({ user });
+}));
+
+
+// Password reset (forgot/reset) lives in features.js, mounted below via
+// mountFeatures() — it already uses securely hashed tokens in a dedicated
+// password_reset_tokens table. A duplicate pair of routes used to live
+// here too; removed, since two handlers registered for the same path is
+// exactly the kind of thing that causes silent, confusing bugs later.
 
 /* ── account settings (customers & vendors) ────────────────────────────── */
 app.get("/api/account", auth, (req, res) => res.json(publicUser(req.user)));
@@ -258,11 +336,36 @@ app.get("/api/vendors/:id", h(async (req, res) => {
   res.json(v);
 }));
 
+app.get("/api/vendors/:id/reviews", h(async (req, res) => res.json(await repo.listReviewsForVendor(req.params.id))));
+
+app.get("/api/vendors/:id/response-time", h(async (req, res) => res.json(await repo.getVendorResponseStats(req.params.id))));
+
+app.post("/api/vendors/:id/reviews", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 10 }), h(async (req, res) => {
+  const { rating, text, author, thumbs } = req.body || {};
+  const r = parseInt(rating);
+  if (!r || r < 1 || r > 5) return res.status(400).json({ error: "rating must be 1-5." });
+  if (thumbs && thumbs !== "up" && thumbs !== "down") return res.status(400).json({ error: "thumbs must be 'up' or 'down'." });
+  const authorName = author || `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Guest";
+  const stats = await repo.createReview(req.params.id, req.user.id, authorName, r, (text || "").slice(0, 1000), thumbs || null);
+  if (!stats) return res.status(503).json({ error: "Reviews aren't set up on the server yet." });
+  res.status(201).json({ ok: true, ...stats });
+}));
+
 /* ── quotes ────────────────────────────────────────────────────────────── */
 app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
   const b = req.body || {};
   if (!b.vendorId) return res.status(400).json({ error: "vendorId is required." });
   const id = await repo.createQuote(b);
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(b.vendorId);
+      const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      if (vendorUser?.email) {
+        const preview = `Quote request${b.eventDate ? " for " + b.eventDate : ""}${b.guests ? ` · ${b.guests} guests` : ""}.${b.notes ? " " + b.notes : ""}`;
+        await sendNewMessageEmail(vendorUser.email, b.name || "A customer", preview, `${APP_URL}/?inbox=1`);
+      }
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true, id });
 }));
 
@@ -285,6 +388,21 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   if (b.experienceSinceYear !== undefined) patch.experienceSinceYear = b.experienceSinceYear;
   if (b.serviceAreas !== undefined) patch.serviceAreas = Array.isArray(b.serviceAreas) ? b.serviceAreas : [];
   if (b.startingPrice !== undefined) patch.startingPrice = b.startingPrice === null ? null : (Number.isFinite(parseInt(b.startingPrice)) ? parseInt(b.startingPrice) : null);
+  if (b.equipmentHire !== undefined) patch.equipmentHire = !!b.equipmentHire;
+  if (b.fullService !== undefined) patch.fullService = !!b.fullService;
+  if (b.instagramHandle !== undefined) patch.instagramHandle = b.instagramHandle || null;
+  if (b.facebookHandle !== undefined) patch.facebookHandle = b.facebookHandle || null;
+  if (b.tiktokHandle !== undefined) patch.tiktokHandle = b.tiktokHandle || null;
+  if (b.website !== undefined) patch.website = b.website || null;
+  if (b.operatingHours !== undefined) patch.operatingHours = b.operatingHours || null;
+  if (b.city !== undefined) patch.city = b.city || null;
+  if (b.region !== undefined) patch.region = b.region || null;
+  if (b.country !== undefined) patch.country = b.country || null;
+  if (b.licenceFile !== undefined) patch.licenceFile = b.licenceFile || null;
+  if (b.licenceExpiry !== undefined) patch.licenceExpiry = b.licenceExpiry || null;
+  if (b.insuranceFile !== undefined) patch.insuranceFile = b.insuranceFile || null;
+  if (b.insuranceExpiry !== undefined) patch.insuranceExpiry = b.insuranceExpiry || null;
+
   // Event Vendors is free — every listing gets the full photo allowance.
   const maxPhotos = 20;
   if (b.photos !== undefined && Array.isArray(b.photos)) patch.photos = b.photos.slice(0, maxPhotos);
@@ -292,14 +410,81 @@ app.put("/api/vendor/listing", auth, requireVendor, h(async (req, res) => {
   res.json(listing);
 }));
 
+
+/* ── TEMP DIAGNOSTIC — remove after messaging is fixed ─────────────────── */
+app.get("/api/debug/messaging", async (req, res) => {
+  const out = { usingPg, steps: [] };
+  try {
+    // Step 1: Can we reach the database?
+    const ping = await query("SELECT 1 AS ok").catch(e => ({ error: e.message }));
+    out.steps.push({ step: "db_ping", result: ping.rows?.[0] || ping });
+
+    // Step 2: Does the threads table exist?
+    const threads = await query("SELECT COUNT(*) AS n FROM threads").catch(e => ({ error: e.message }));
+    out.steps.push({ step: "threads_table", result: threads.rows?.[0] || threads });
+
+    // Step 3: Does thread_messages table exist?
+    const msgs = await query("SELECT COUNT(*) AS n FROM thread_messages").catch(e => ({ error: e.message }));
+    out.steps.push({ step: "thread_messages_table", result: msgs.rows?.[0] || msgs });
+
+    // Step 4: Check threads columns
+    const cols = await query(
+      "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='threads' ORDER BY ordinal_position"
+    ).catch(e => ({ error: e.message }));
+    out.steps.push({ step: "threads_columns", result: cols.rows || cols });
+
+    // Step 5: Check constraints on threads
+    const cons = await query(
+      "SELECT conname, contype FROM pg_constraint WHERE conrelid='threads'::regclass"
+    ).catch(e => ({ error: e.message }));
+    out.steps.push({ step: "threads_constraints", result: cons.rows || cons });
+
+    // Step 6: Try a test INSERT (vendorId=999999, customerId=999999 — won't conflict with real data)
+    const testInsert = await query(
+      "INSERT INTO threads (vendor_id, customer_id, subject, kind) VALUES ($1,$2,$3,$4) RETURNING id",
+      [999999, 999999, "DIAG_TEST", "message"]
+    ).catch(e => ({ error: e.message, code: e.code }));
+    out.steps.push({ step: "test_insert", result: testInsert.rows?.[0] || testInsert });
+
+    // Step 7: Clean up test row
+    if (testInsert.rows?.[0]) {
+      await query("DELETE FROM threads WHERE subject='DIAG_TEST'").catch(() => {});
+      out.steps.push({ step: "cleanup", result: "ok" });
+    }
+
+    res.json(out);
+  } catch (e) {
+    out.error = e.message;
+    res.status(500).json(out);
+  }
+});
+/* ── END TEMP DIAGNOSTIC ────────────────────────────────────────────────── */
+
 /* ── messaging — two-sided: customer ⇄ vendor, one thread per pair ──────── */
-app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), h(async (req, res) => {
-  const { vendorId, subject, body, kind } = req.body || {};
-  if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
-  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind });
-  await repo.addThreadMessage(thread.id, "customer", body);
-  res.status(201).json({ ok: true, threadId: "th" + thread.id });
-}));
+app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 }), async (req, res) => {
+  try {
+    const { vendorId, subject, body, kind } = req.body || {};
+    if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
+    let thread;
+    try { thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind }); }
+    catch (e1) { return res.status(500).json({ error: "Thread creation failed", detail: e1.message, vendorId, customerId: req.user.id }); }
+    try { await repo.addThreadMessage(thread.id, "customer", body); }
+    catch (e2) { return res.status(500).json({ error: "Message save failed", detail: e2.message, threadId: thread.id }); }
+  // Email the vendor — this is what makes a message actually reach someone
+  // instead of just sitting unread in a dashboard inbox they may not check.
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(vendorId);
+      const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      if (vendorUser?.email) {
+        const fromName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "A customer";
+        await sendNewMessageEmail(vendorUser.email, fromName, body, `${APP_URL}/?inbox=1`);
+      }
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
+    res.status(201).json({ ok: true, threadId: "th" + thread.id });
+  } catch (e) { res.status(500).json({ error: "Unexpected error", detail: e.message }); }
+});
 
 app.get("/api/threads", auth, h(async (req, res) => {
   if (req.user.role === "vendor") {
@@ -314,8 +499,57 @@ app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, m
   const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
   const { body } = req.body || {};
   if (!body) return res.status(400).json({ error: "body is required." });
-  await repo.addThreadMessage(threadId, req.user.role === "vendor" ? "vendor" : "customer", body);
+  const senderRole = req.user.role === "vendor" ? "vendor" : "customer";
+  await repo.addThreadMessage(threadId, senderRole, body);
+  // Email whichever party did NOT just send this — a reply is exactly the
+  // moment someone is actively waiting to hear back.
+  (async () => {
+    try {
+      const thread = await repo.getThreadById(threadId);
+      if (!thread) return;
+      const fromName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || (senderRole === "vendor" ? "A vendor" : "A customer");
+      let recipientEmail = null;
+      if (senderRole === "vendor") {
+        const customer = await repo.findUserById(thread.customer_id);
+        recipientEmail = customer?.email;
+      } else {
+        const vendor = await repo.findVendorById(thread.vendor_id);
+        const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+        recipientEmail = vendorUser?.email;
+      }
+      if (recipientEmail) await sendNewMessageEmail(recipientEmail, fromName, body, `${APP_URL}/?inbox=1`);
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true });
+}));
+
+// Mark a thread as read (vendor or customer opens their inbox)
+app.delete("/api/threads/:id", auth, h(async (req, res) => {
+  const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
+  const role = req.user.role === "vendor" ? "vendor" : "customer";
+  // verify the requester is a participant in this thread
+  const thread = await repo.getThreadById(threadId);
+  if (!thread) return res.status(404).json({ error: "Thread not found." });
+  const isParticipant =
+    (role === "customer" && thread.customer_id === req.user.id) ||
+    (role === "vendor"   && thread.vendor_id  !== undefined);
+  if (!isParticipant) return res.status(403).json({ error: "Not authorised." });
+  await repo.deleteThread(threadId, role);
+  res.json({ ok: true });
+}));
+
+app.post("/api/threads/:id/read", auth, h(async (req, res) => {
+  const threadId = parseInt(String(req.params.id).replace(/^th/, ""));
+  await repo.markThreadRead(threadId, req.user.role);
+  res.json({ ok: true });
+}));
+
+// Vendor enquiry stats — total enquiry threads received (for dashboard)
+app.get("/api/vendor/enquiries/count", auth, requireVendor, h(async (req, res) => {
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.json({ count: 0 });
+  const threads = await repo.listThreadsFor({ role: "vendor", vendorId: listing.id });
+  res.json({ count: threads.length });
 }));
 
 /* ── bookings — free, confirmed immediately, no payment involved ────────── */
@@ -326,7 +560,15 @@ app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 })
   const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, eventDate: date || null, guests: guests || null, location: location || "" });
   // Drop a thread message too, so the booking shows up in the vendor's inbox as well as their bookings list.
   const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking confirmed", kind: "booking" }).catch(() => null);
-  if (thread) await repo.addThreadMessage(thread.id, "customer", `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`).catch(() => {});
+  const bookingText = `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`;
+  if (thread) await repo.addThreadMessage(thread.id, "customer", bookingText).catch(() => {});
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(vendorId);
+      const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      if (vendorUser?.email) await sendNewMessageEmail(vendorUser.email, customerName, bookingText, `${APP_URL}/?inbox=1`);
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
   res.status(201).json({ ok: true, id: "bk" + booking.id });
 }));
 
@@ -337,6 +579,12 @@ app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
 }));
 
 app.get("/api/bookings", auth, h(async (req, res) => res.json(await repo.listBookingsForCustomer(req.user.id))));
+
+app.post("/api/bookings/:id/cancel", auth, h(async (req, res) => {
+  const ok = await repo.cancelBooking(req.params.id, req.user.id);
+  if (!ok) return res.status(404).json({ error: "Booking not found, or it doesn't belong to you." });
+  res.json({ ok: true });
+}));
 
 /* ── premium tiers — founding spots now, paid monthly/yearly later ──────── */
 app.get("/api/premium/stats", h(async (req, res) => {
@@ -405,6 +653,26 @@ app.delete("/api/admin/vendors/:id", admin, h(async (req, res) => {
 mountFeatures(app, { auth, requireVendor, repo });
 // To enable uploads + real Stripe, install deps then uncomment (see INTEGRATION.md):
 mountMedia(app, { auth, requireVendor, repo });
+mountClaim(app, { repo, email: emailModule, generateToken: signToken });
+
+// ── GET /api/vendors/unclaimed ─────────────────────────────────────────────
+// Returns pre-populated, unclaimed vendor listings so vendors can find and
+// claim their business. Supports ?q= search and ?country= filter.
+app.get("/api/vendors/unclaimed", async (req, res) => {
+  try {
+    const { q = "", country = "", page = "1", limit = "24" } = req.query;
+    const vendors = await repo.listUnclaimedVendors({
+      q: String(q).trim(),
+      country: String(country).trim(),
+      page: Math.max(1, parseInt(page) || 1),
+      limit: Math.min(48, parseInt(limit) || 24),
+    });
+    res.json({ vendors, total: vendors.length });
+  } catch (e) {
+    console.error("[unclaimed] error:", e.message);
+    res.status(500).json({ error: "Could not load unclaimed listings." });
+  }
+});
 mountCompliance(app, {
   auth, requireVendor, repo,
   sendEmail: async ({ to, subject, html }) => {
@@ -421,6 +689,50 @@ mountAnalytics(app, { rateLimit, query, usingPg, admin });
 const PORT = process.env.PORT || 4000;
 (async () => {
   await repo.init();
+  // Ensure thread_messages table exists (might be missing if schema_v7 was not run)
+  if (repo.ensureMessagingTables) await repo.ensureMessagingTables().catch(e=>console.error("[startup] messaging table check:",e.message));
+
   await ensureSeeded();
   app.listen(PORT, () => console.log(`Event Vendors API running on http://localhost:${PORT}`));
 })().catch((e) => { console.error("Failed to start:", e); process.exit(1); });
+
+// ── POST /api/admin/import-vendors ────────────────────────────────────────────
+// Bulk-import pre-populated vendor records (from Yelp, Google, CSV, etc.)
+// Body: { secret, vendors: [{ name, cat, city, region, country, phone, about,
+//         website, source, sourceId, sourceUrl, hue, rating, reviews }] }
+// IMPORTANT: protect with ADMIN_SECRET env var before going to production.
+app.post("/api/admin/import-vendors", async (req, res) => {
+  const { secret, vendors: batch } = req.body || {};
+  const expectedSecret = process.env.ADMIN_SECRET || "ev-admin-2026";
+  if (secret !== expectedSecret)
+    return res.status(403).json({ error: "Forbidden." });
+  if (!Array.isArray(batch) || batch.length === 0)
+    return res.status(400).json({ error: "Provide a non-empty vendors array." });
+
+  const results = { inserted: 0, skipped: 0, errors: [] };
+  for (const v of batch) {
+    try {
+      const id = await repo.insertPrePopulatedVendor({
+        name:      String(v.name || "").trim(),
+        cat:       String(v.cat  || "mgmt").toLowerCase(),
+        city:      String(v.city || "").trim(),
+        region:    String(v.region || v.state || "").trim(),
+        country:   String(v.country || "United States").trim(),
+        about:     String(v.about || v.pitch || "").slice(0, 280),
+        phone:     String(v.phone || v.businessPhone || "").trim(),
+        website:   String(v.website || "").trim(),
+        source:    String(v.source || "manual"),
+        sourceId:  v.sourceId || null,
+        sourceUrl: v.sourceUrl || v.source_url || null,
+        hue:       Number(v.hue) || Math.floor(Math.random() * 340),
+        rating:    Number(v.rating) || 0,
+        reviews:   Number(v.reviews) || 0,
+      });
+      if (id) results.inserted++;
+      else     results.skipped++;  // ON CONFLICT DO NOTHING (duplicate source_id)
+    } catch (e) {
+      results.errors.push({ name: v.name, error: e.message });
+    }
+  }
+  res.json({ ok: true, ...results });
+});
