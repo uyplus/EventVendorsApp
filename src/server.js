@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import jwt from "jsonwebtoken";
 import { repo } from "./repo.js";
 import { query, usingPg } from "./db.js";
 import { ensureSeeded } from "./seed.js";
@@ -369,8 +370,8 @@ app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(asyn
     const hh = req.headers.authorization || "";
     const token = hh.startsWith("Bearer ") ? hh.slice(7) : null;
     if (token) {
-      const jwt = (await import("jsonwebtoken")).default;
-      const payload = jwt.verify(token, process.env.JWT_SECRET || "dev-secret-change-me");
+      const jwt_secret = process.env.JWT_SECRET || "dev-secret-change-me";
+      const payload = jwt.verify(token, jwt_secret);
       quoteUser = await repo.findUserById(payload.id);
     }
   } catch (e) { /* anonymous quote — fine */ }
