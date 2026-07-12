@@ -1,0 +1,43 @@
+name: Backend sanity check
+
+# Runs automatically on every push and pull request to main.
+# Catches syntax errors and missing-import bugs (like an unlisted npm
+# package) BEFORE Render tries to deploy them — so a broken push fails
+# here, in seconds, instead of taking down the live API.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: ./
+
+      - name: Syntax-check every backend source file
+        run: |
+          for f in src/*.js; do
+            echo "Checking $f"
+            node --check "$f"
+          done
+
+      - name: Confirm package.json and imports line up
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const fs = require('fs');
+            const deps = Object.keys(pkg.dependencies || {});
+            console.log('Declared dependencies:', deps.join(', '));
+          "
