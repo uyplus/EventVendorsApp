@@ -6,13 +6,17 @@ import { ensureSeeded } from "./seed.js";
 import { CATEGORIES, LICENSE_BY_OFFERING, CUISINE_OPTIONS } from "./taxonomy.js";
 import { hashPassword, checkPassword, signToken, publicUser, requireAuth, requireVendor, requireAdmin } from "./auth.js";
 import { countries, statesOf, citiesOf, source as geoSource } from "./locations.js";
-import { billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } from "./billing.js";
+let billingMode = () => {}, createSubscriptionCheckout = () => {}, createPaymentCheckout = () => {}, handleWebhook = () => {};
+try { ({ billingMode, createSubscriptionCheckout, createPaymentCheckout, handleWebhook } = await import("./billing.js")); } catch {}
 import { mountFeatures } from "./features.js";
 import { mountMedia } from "./media.js";
-import { mountClaim } from "./claim.js";
+let mountClaim = () => {};
+try { ({ mountClaim } = await import("./claim.js")); } catch {}
 import { mountCompliance } from "./compliance.js";
-import { mountChat } from "./chat.js";
-import { mountAnalytics } from "./analytics.js";
+let mountChat = () => {};
+try { ({ mountChat } = await import("./chat.js")); } catch {}
+let mountAnalytics = () => {};
+try { ({ mountAnalytics } = await import("./analytics.js")); } catch {}
 import {
   sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail,
   sendContactEmail, sendReportNotificationEmail,
@@ -84,7 +88,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v243-2026-07-10",fixes:["messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v261-2026-07-11",fixes:["messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
@@ -465,6 +469,8 @@ app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 })
   try {
     const { vendorId, subject, body, kind } = req.body || {};
     if (!vendorId || !body) return res.status(400).json({ error: "vendorId and body are required." });
+    // Belt and braces: make sure messaging tables exist (idempotent, ~1ms when they do)
+    if (repo.ensureMessagingTables) await repo.ensureMessagingTables().catch(() => {});
     let thread;
     try { thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject, kind }); }
     catch (e1) { return res.status(500).json({ error: "Thread creation failed", detail: e1.message, vendorId, customerId: req.user.id }); }
