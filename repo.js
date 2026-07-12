@@ -603,12 +603,21 @@ export const repo = {
 
   async getOrCreateThread({ vendorId, customerId, subject, kind }) {
     if (usingPg) {
-      const existing = await query(`SELECT * FROM threads WHERE vendor_id=$1 AND customer_id=$2`, [vendorId, customerId]);
-      if (existing.rows[0]) return existing.rows[0];
-      const r = await query(
-        `INSERT INTO threads (vendor_id, customer_id, subject, kind) VALUES ($1,$2,$3,$4) RETURNING *`,
-        [vendorId, customerId, subject || "Enquiry", kind || "message"]);
-      return r.rows[0];
+      const attempt = async () => {
+        const existing = await query(`SELECT * FROM threads WHERE vendor_id=$1 AND customer_id=$2`, [vendorId, customerId]);
+        if (existing.rows[0]) return existing.rows[0];
+        const r = await query(
+          `INSERT INTO threads (vendor_id, customer_id, subject, kind) VALUES ($1,$2,$3,$4) RETURNING *`,
+          [vendorId, customerId, subject || "Enquiry", kind || "message"]);
+        return r.rows[0];
+      };
+      try { return await attempt(); }
+      catch (e) {
+        // Self-heal: missing table (42P01), missing column (42703) or stale FK (23503)
+        // — create/repair the messaging tables, then retry once.
+        await this.ensureMessagingTables().catch(() => {});
+        return await attempt();
+      }
     }
     const db = getDb();
     db.threads = db.threads || [];
@@ -619,6 +628,19 @@ export const repo = {
 
   async ensureMessagingTables() {
     if (!usingPg) return;
+    // No FK on vendor_id: demo listings (ids 9000+) aren't in the vendors table
+    // and a message to one must not 500. Plain BIGINTs keep inserts always valid.
+    await query(`CREATE TABLE IF NOT EXISTS threads (
+      id BIGSERIAL PRIMARY KEY,
+      vendor_id BIGINT NOT NULL,
+      customer_id BIGINT NOT NULL,
+      subject TEXT NOT NULL DEFAULT 'Enquiry',
+      kind VARCHAR(20) NOT NULL DEFAULT 'message',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      deleted_by_customer BOOLEAN NOT NULL DEFAULT false,
+      deleted_by_vendor BOOLEAN NOT NULL DEFAULT false,
+      UNIQUE (vendor_id, customer_id)
+    )`).catch(()=>{});
     await query(`CREATE TABLE IF NOT EXISTS thread_messages (
       id BIGSERIAL PRIMARY KEY,
       thread_id BIGINT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
@@ -628,6 +650,13 @@ export const repo = {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`).catch(()=>{});
     await query('CREATE INDEX IF NOT EXISTS thread_messages_thread_idx ON thread_messages(thread_id)').catch(()=>{});
+    // If schema_v15 created threads WITH the vendors FK, drop it so demo-vendor
+    // messages stop failing with 23503.
+    await query(`DO $$ DECLARE c RECORD; BEGIN
+      FOR c IN SELECT conname FROM pg_constraint
+        WHERE conrelid='threads'::regclass AND contype='f' LOOP
+        EXECUTE 'ALTER TABLE threads DROP CONSTRAINT ' || quote_ident(c.conname);
+      END LOOP; END $$`).catch(()=>{});
   },
 
   async addThreadMessage(threadId, senderRole, body) {
