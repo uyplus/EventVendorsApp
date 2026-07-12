@@ -18,7 +18,7 @@ try { ({ mountChat } = await import("./chat.js")); } catch {}
 let mountAnalytics = () => {};
 try { ({ mountAnalytics } = await import("./analytics.js")); } catch {}
 import {
-  sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail,
+  sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail, sendNotificationEmail,
   sendContactEmail, sendReportNotificationEmail,
   sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
   sendClaimEmail,
@@ -360,13 +360,54 @@ app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(asyn
   const b = req.body || {};
   if (!b.vendorId) return res.status(400).json({ error: "vendorId is required." });
   const id = await repo.createQuote(b);
+
+  // A quote is a conversation-starter: if the requester is logged in, drop it
+  // into the messaging inbox too so vendor and customer can continue there.
+  // (Optional auth — anonymous quotes still work, they just stay email-only.)
+  let quoteUser = null;
+  try {
+    const hh = req.headers.authorization || "";
+    const token = hh.startsWith("Bearer ") ? hh.slice(7) : null;
+    if (token) {
+      const jwt = (await import("jsonwebtoken")).default;
+      const payload = jwt.verify(token, process.env.JWT_SECRET || "dev-secret-change-me");
+      quoteUser = await repo.findUserById(payload.id);
+    }
+  } catch (e) { /* anonymous quote — fine */ }
+
+  if (quoteUser) {
+    try {
+      if (repo.ensureMessagingTables) await repo.ensureMessagingTables().catch(() => {});
+      const thread = await repo.getOrCreateThread({
+        vendorId: b.vendorId, customerId: quoteUser.id,
+        subject: `Quote request${b.offering ? " \u2014 " + b.offering : ""}`, kind: "quote"
+      });
+      const lines = [
+        "\ud83d\udccb Quote request",
+        b.eventDate ? `Event date: ${b.eventDate}` : null,
+        b.guests ? `Guests: ${b.guests}` : null,
+        b.location ? `Location: ${b.location}` : null,
+        b.budget ? `Budget: ${b.budget}` : null,
+        b.notes ? `Notes: ${b.notes}` : null
+      ].filter(Boolean).join("\n");
+      await repo.addThreadMessage(thread.id, "customer", lines || "Quote request");
+    } catch (e) { console.error("[quotes] thread create:", e.message); }
+  }
+
   (async () => {
     try {
       const vendor = await repo.findVendorById(b.vendorId);
       const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
+      const preview = `Quote request${b.eventDate ? " for " + b.eventDate : ""}${b.guests ? ` \u00b7 ${b.guests} guests` : ""}.${b.notes ? " " + b.notes : ""}`;
+      // Tell the vendor they've been contacted
       if (vendorUser?.email) {
-        const preview = `Quote request${b.eventDate ? " for " + b.eventDate : ""}${b.guests ? ` · ${b.guests} guests` : ""}.${b.notes ? " " + b.notes : ""}`;
-        await sendNewMessageEmail(vendorUser.email, b.name || "A customer", preview, `${APP_URL}/?inbox=1`);
+        await sendNewMessageEmail(vendorUser.email, b.name || quoteUser?.firstName || "A customer", preview, `${APP_URL}/?inbox=1`);
+      }
+      // Confirm to the customer that their request went out
+      const customerEmail = quoteUser?.email || b.email;
+      if (customerEmail && vendor?.name) {
+        await sendNotificationEmail(customerEmail,
+          `Your quote request was sent to ${vendor.name}. Replies land in your EventVendors inbox \u2014 we'll email you when they respond.`);
       }
     } catch (e) { /* never block the request over a mail failure */ }
   })();
