@@ -409,8 +409,16 @@ export const repo = {
   },
 
   async findVendorByOwner(userId) {
-    if (usingPg) return toVendor((await query("SELECT * FROM vendors WHERE owner_user_id=$1 LIMIT 1", [userId])).rows[0]) || null;
+    if (usingPg) return toVendor((await query("SELECT * FROM vendors WHERE owner_user_id=$1 ORDER BY id DESC LIMIT 1", [userId])).rows[0]) || null;
     return getDb().vendors.find((v) => String(v.ownerUserId) === String(userId)) || null;
+  },
+
+  // ALL listing ids owned by this user — a vendor account can have more than
+  // one listing row (duplicates from earlier broken deploys, re-claims, etc.)
+  // and inbox/booking lookups must span every one of them.
+  async findVendorIdsByOwner(userId) {
+    if (usingPg) return (await query("SELECT id FROM vendors WHERE owner_user_id=$1", [userId])).rows.map((r) => Number(r.id));
+    return getDb().vendors.filter((v) => String(v.ownerUserId) === String(userId)).map((v) => v.id);
   },
 
   async listActiveVendors() {
@@ -685,16 +693,21 @@ export const repo = {
 
   // Threads + their messages, for whichever side (customer or vendor) is asking.
   async listThreadsFor({ role, userId, vendorId }) {
+    // vendorId may be a single id or an array of ids — a vendor account can
+    // end up with more than one listing row (e.g. duplicates created during
+    // earlier broken deploys), and the inbox must show threads for ALL of
+    // them, not whichever row a LIMIT 1 lookup happened to return.
+    const vendorIds = (Array.isArray(vendorId) ? vendorId : [vendorId]).filter((x) => x != null);
     if (usingPg) {
-      const where = role === "vendor" ? `t.vendor_id = $1` : `t.customer_id = $1`;
-      const param = role === "vendor" ? vendorId : userId;
+      const where = role === "vendor" ? `t.vendor_id = ANY($1)` : `t.customer_id = $1`;
+      const param = role === "vendor" ? [vendorIds] : [userId];
       const threads = (await query(
         `SELECT t.*, v.name AS vendor_name, u.first_name, u.last_name
          FROM threads t
          LEFT JOIN vendors v ON v.id = t.vendor_id
          LEFT JOIN users u ON u.id = t.customer_id
          WHERE ${where}
-         ORDER BY t.created_at DESC`, [param])).rows;
+         ORDER BY t.created_at DESC`, param)).rows;
       const out = [];
       for (const t of threads) {
         const msgs = (await query(`SELECT * FROM thread_messages WHERE thread_id=$1 ORDER BY created_at ASC`, [t.id])).rows;
@@ -713,7 +726,7 @@ export const repo = {
       return out;
     }
     const db = getDb();
-    const threads = (db.threads || []).filter((t) => role === "vendor" ? t.vendorId === vendorId : t.customerId === userId);
+    const threads = (db.threads || []).filter((t) => role === "vendor" ? vendorIds.some((vid) => String(vid) === String(t.vendorId)) : t.customerId === userId);
     return threads.map((t) => {
       const msgs = (db.threadMessages || []).filter((m) => m.threadId === t.id);
       const vendor = (db.vendors || []).find((v) => v.id === t.vendorId);
@@ -775,25 +788,29 @@ export const repo = {
   async respondToBooking(bookingId, vendorId, decision) {
     const rawId = String(bookingId).replace(/^bk/, "");
     const status = decision === "accept" ? "confirmed" : "declined";
+    const ids = (Array.isArray(vendorId) ? vendorId : [vendorId]).filter((x) => x != null);
     if (usingPg) {
       const r = await query(
-        `UPDATE bookings SET status=$1 WHERE id=$2 AND vendor_id=$3 AND status='pending' RETURNING *`,
-        [status, rawId, vendorId]);
+        `UPDATE bookings SET status=$1 WHERE id=$2 AND vendor_id=ANY($3) AND status='pending' RETURNING *`,
+        [status, rawId, ids]);
       return r.rows[0] || null;
     }
     const db = getDb();
-    const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && String(x.vendorId) === String(vendorId) && x.status === "pending");
+    const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && ids.some((vid) => String(vid) === String(x.vendorId)) && x.status === "pending");
     if (!b) return null;
     b.status = status; memSave(); return b;
   },
 
   async listBookingsForVendor(vendorId) {
+    // vendorId may be a single id or an array — span every listing this
+    // vendor owns (see findVendorIdsByOwner for why duplicates can exist).
+    const ids = (Array.isArray(vendorId) ? vendorId : [vendorId]).filter((x) => x != null);
     if (usingPg) {
-      const r = await query(`SELECT * FROM bookings WHERE vendor_id=$1 ORDER BY event_date ASC NULLS LAST, created_at DESC`, [vendorId]);
+      const r = await query(`SELECT * FROM bookings WHERE vendor_id=ANY($1) ORDER BY event_date ASC NULLS LAST, created_at DESC`, [ids]);
       return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, customerName: b.customer_name, date: b.event_date, guests: b.guests, location: b.location, status: b.status }));
     }
     const db = getDb();
-    return (db.bookings || []).filter((b) => b.vendorId === vendorId)
+    return (db.bookings || []).filter((b) => ids.some((vid) => String(vid) === String(b.vendorId)))
       .map((b) => ({ id: "bk" + b.id, vendorId: b.vendorId, customerName: b.customerName, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }));
   },
 

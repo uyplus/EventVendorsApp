@@ -93,7 +93,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v267-2026-07-15",fixes:["routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v268-2026-07-15",fixes:["multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
@@ -539,9 +539,9 @@ app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 })
 
 app.get("/api/threads", auth, h(async (req, res) => {
   if (req.user.role === "vendor") {
-    const listing = await repo.findVendorByOwner(req.user.id);
-    if (!listing) return res.json([]);
-    return res.json(await repo.listThreadsFor({ role: "vendor", vendorId: listing.id }));
+    const ids = await repo.findVendorIdsByOwner(req.user.id);
+    if (!ids.length) return res.json([]);
+    return res.json(await repo.listThreadsFor({ role: "vendor", vendorId: ids }));
   }
   res.json(await repo.listThreadsFor({ role: "customer", userId: req.user.id }));
 }));
@@ -626,8 +626,9 @@ app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 })
 
 app.post("/api/vendor/bookings/:id/accept", auth, requireVendor, h(async (req, res) => {
   const listing = await repo.findVendorByOwner(req.user.id);
-  if (!listing) return res.status(404).json({ error: "No vendor listing found for this account." });
-  const booking = await repo.respondToBooking(req.params.id, listing.id, "accept");
+  const ownedIds = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ownedIds.length) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const booking = await repo.respondToBooking(req.params.id, ownedIds, "accept");
   if (!booking) return res.status(404).json({ error: "Booking not found, already responded to, or doesn't belong to you." });
   (async () => {
     try {
@@ -641,8 +642,9 @@ app.post("/api/vendor/bookings/:id/accept", auth, requireVendor, h(async (req, r
 
 app.post("/api/vendor/bookings/:id/decline", auth, requireVendor, h(async (req, res) => {
   const listing = await repo.findVendorByOwner(req.user.id);
-  if (!listing) return res.status(404).json({ error: "No vendor listing found for this account." });
-  const booking = await repo.respondToBooking(req.params.id, listing.id, "decline");
+  const ownedIds = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ownedIds.length) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const booking = await repo.respondToBooking(req.params.id, ownedIds, "decline");
   if (!booking) return res.status(404).json({ error: "Booking not found, already responded to, or doesn't belong to you." });
   (async () => {
     try {
@@ -655,9 +657,9 @@ app.post("/api/vendor/bookings/:id/decline", auth, requireVendor, h(async (req, 
 }));
 
 app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
-  const listing = await repo.findVendorByOwner(req.user.id);
-  if (!listing) return res.json([]);
-  res.json(await repo.listBookingsForVendor(listing.id));
+  const ids = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ids.length) return res.json([]);
+  res.json(await repo.listBookingsForVendor(ids));
 }));
 
 app.get("/api/bookings", auth, h(async (req, res) => res.json(await repo.listBookingsForCustomer(req.user.id))));
