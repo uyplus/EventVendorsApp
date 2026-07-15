@@ -60,14 +60,16 @@ export function sendWelcomeEmail(to, firstName, role) {
   return send({ to, subject: `Welcome to Event Vendors, ${name}`, html: shell("Welcome to Event Vendors", body) });
 }
 
-export function sendNewMessageEmail(to, fromName, preview, link) {
-  const trimmed = (preview || "").slice(0, 160);
+export function sendNewMessageEmail(to, fromName, kind, link) {
+  const isQuote = kind === "quote";
+  const subject = isQuote ? `Quote Request from ${fromName}` : `New Message from ${fromName}`;
+  const noun = isQuote ? "quote request" : "message";
   return send({
-    to, subject: `New message from ${fromName} — Event Vendors`,
+    to, subject,
     html: shell("You have a new message", `
-      <p><b>${fromName}</b> sent you a message:</p>
-      <p style="background:#F6F1E9;border-radius:10px;padding:12px 14px;color:#1E1A2B;font-style:italic">"${trimmed}${trimmed.length === 160 ? "…" : ""}"</p>
-      <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Reply now</a></p>`),
+      <p>You have a ${noun} from <b>${fromName}</b> in your inbox.</p>
+      <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">View in inbox</a></p>
+      <p style="font-size:12px;color:#8a8594">This is a notification only — replies sent to this email address will not reach ${fromName}. Please reply from your Event Vendors inbox.</p>`),
   });
 }
 

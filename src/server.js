@@ -19,11 +19,15 @@ try { ({ mountChat } = await import("./chat.js")); } catch {}
 let mountAnalytics = () => {};
 try { ({ mountAnalytics } = await import("./analytics.js")); } catch {}
 import {
-  sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail, sendNotificationEmail,
+  sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail,
   sendContactEmail, sendReportNotificationEmail,
   sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
   sendClaimEmail,
 } from "./email.js";
+import * as EMAILS from "./email.js";
+// Defensive: older copies of email.js may not export sendNotificationEmail.
+// A missing named import would crash Node at startup, so resolve it at runtime.
+const sendNotificationEmail = EMAILS.sendNotificationEmail || (async () => {});
 const emailModule = { sendClaimEmail };
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
@@ -399,10 +403,9 @@ app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(asyn
     try {
       const vendor = await repo.findVendorById(b.vendorId);
       const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
-      const preview = `Quote request${b.eventDate ? " for " + b.eventDate : ""}${b.guests ? ` \u00b7 ${b.guests} guests` : ""}.${b.notes ? " " + b.notes : ""}`;
       // Tell the vendor they've been contacted
       if (vendorUser?.email) {
-        await sendNewMessageEmail(vendorUser.email, b.name || quoteUser?.firstName || "A customer", preview, `${APP_URL}/?inbox=1`);
+        await sendNewMessageEmail(vendorUser.email, b.name || quoteUser?.firstName || "A customer", "quote", `${APP_URL}/?inbox=1`);
       }
       // Confirm to the customer that their request went out
       const customerEmail = quoteUser?.email || b.email;
@@ -526,7 +529,7 @@ app.post("/api/messages", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 60 })
       const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
       if (vendorUser?.email) {
         const fromName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "A customer";
-        await sendNewMessageEmail(vendorUser.email, fromName, body, `${APP_URL}/?inbox=1`);
+        await sendNewMessageEmail(vendorUser.email, fromName, "message", `${APP_URL}/?inbox=1`);
       }
     } catch (e) { /* never block the request over a mail failure */ }
   })();
@@ -565,7 +568,7 @@ app.post("/api/threads/:id/reply", auth, rateLimit({ windowMs: 60 * 60 * 1000, m
         const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
         recipientEmail = vendorUser?.email;
       }
-      if (recipientEmail) await sendNewMessageEmail(recipientEmail, fromName, body, `${APP_URL}/?inbox=1`);
+      if (recipientEmail) await sendNewMessageEmail(recipientEmail, fromName, "message", `${APP_URL}/?inbox=1`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.status(201).json({ ok: true });
@@ -614,7 +617,7 @@ app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 })
     try {
       const vendor = await repo.findVendorById(vendorId);
       const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
-      if (vendorUser?.email) await sendNewMessageEmail(vendorUser.email, customerName, bookingText, `${APP_URL}/?inbox=1`);
+      if (vendorUser?.email) await sendNewMessageEmail(vendorUser.email, customerName, "message", `${APP_URL}/?inbox=1`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.status(201).json({ ok: true, id: "bk" + booking.id });
