@@ -56,23 +56,9 @@ export function mountFeatures(app, { auth, requireVendor, repo }) {
     res.status(201).json({ ok: true });
   }));
 
-  /* bookings */
-  app.post("/api/bookings", auth, wrap(async (req, res) => {
-    const { vendorId, date, guests, amount } = req.body || {};
-    if (!vendorId) return res.status(400).json({ error: "vendorId is required." });
-    if (!usingPg) return res.status(201).json({ ok: true });
-    const v = (await query("SELECT owner_user_id, name FROM vendors WHERE id=$1", [vendorId])).rows[0];
-    if (!v) return res.status(404).json({ error: "Vendor not found." });
-    const r = await query("INSERT INTO bookings (vendor_id,customer_user_id,customer_name,event_date,guests,amount,status) VALUES ($1,$2,$3,$4,$5,$6,'confirmed') RETURNING id",
-      [vendorId, req.user.id, fullName(req.user), date || "", guests || null, Math.round(amount || 0)]);
-    await notify(Number(v.owner_user_id), `New booking${date ? ` for ${date}` : ""}${guests ? ` - ${guests} guests` : ""}.`);
-    res.status(201).json({ ok: true, id: Number(r.rows[0].id) });
-  }));
-  app.get("/api/vendor/bookings", auth, requireVendor, wrap(async (req, res) => {
-    if (!usingPg) return res.json([]);
-    const rows = (await query("SELECT b.* FROM bookings b JOIN vendors v ON v.id=b.vendor_id WHERE v.owner_user_id=$1 ORDER BY b.created_at DESC", [req.user.id])).rows;
-    res.json(rows.map((b) => ({ id: Number(b.id), customerName: b.customer_name, date: b.event_date, guests: b.guests, amount: b.amount, status: b.status })));
-  }));
+  /* bookings — handled canonically by server.js (pending/accept/decline flow,
+     v265+). The old auto-confirm duplicates that lived here were removed so
+     there is exactly one source of truth and no route-order dependence. */
 
   /* notifications */
   app.get("/api/notifications", auth, wrap(async (req, res) => {
@@ -85,37 +71,11 @@ export function mountFeatures(app, { auth, requireVendor, repo }) {
     res.json({ ok: true });
   }));
 
-  /* messaging */
-  const role = (u) => (u.role === "vendor" ? "vendor" : "customer");
-  app.get("/api/threads", auth, wrap(async (req, res) => {
-    if (!usingPg) return res.json([]);
-    const r = role(req.user);
-    const col = r === "vendor" ? "v.owner_user_id" : "t.customer_user_id";
-    const threads = (await query(`SELECT t.*, v.name AS vendor_name FROM threads t JOIN vendors v ON v.id=t.vendor_id WHERE ${col}=$1 ORDER BY t.updated_at DESC`, [req.user.id])).rows;
-    const out = [];
-    for (const t of threads) {
-      const msgs = (await query("SELECT * FROM messages WHERE thread_id=$1 ORDER BY created_at", [t.id])).rows;
-      out.push({ id: Number(t.id), vendorId: Number(t.vendor_id), vendorName: t.vendor_name, subject: t.subject,
-        unread: r === "vendor" ? t.vendor_unread : t.customer_unread,
-        messages: msgs.map((m) => ({ from: m.sender === r ? "me" : (r === "vendor" ? "customer" : "vendor"), text: m.body, time: timeAgo(m.created_at) })) });
-    }
-    res.json(out);
-  }));
-  // /api/messages now handled by server.js (v234+)
-  app.post("/api/threads/:id/reply", auth, wrap(async (req, res) => {
-    if (!usingPg) return res.json({ ok: true });
-    const r = role(req.user);
-    await query("INSERT INTO messages (thread_id,sender,body) VALUES ($1,$2,$3)", [req.params.id, r, String(req.body?.text || "")]);
-    const other = r === "vendor" ? "customer_unread" : "vendor_unread";
-    await query(`UPDATE threads SET ${other}=TRUE, updated_at=now() WHERE id=$1`, [req.params.id]);
-    const row = (await query("SELECT t.customer_user_id, v.owner_user_id FROM threads t JOIN vendors v ON v.id=t.vendor_id WHERE t.id=$1", [req.params.id])).rows[0];
-    if (row) await notify(Number(r === "vendor" ? row.customer_user_id : row.owner_user_id), "New reply to your conversation.");
-    res.json({ ok: true });
-  }));
-  app.post("/api/threads/:id/read", auth, wrap(async (req, res) => {
-    if (usingPg) { const col = role(req.user) === "vendor" ? "vendor_unread" : "customer_unread"; await query(`UPDATE threads SET ${col}=FALSE WHERE id=$1`, [req.params.id]); }
-    res.json({ ok: true });
-  }));
+  /* messaging — handled canonically by server.js (threads/thread_messages
+     schema, v261+). The duplicates that lived here queried the OLD schema
+     (messages table, customer_user_id, vendor_unread columns) which the new
+     message flow never writes to — if these routes ever won the route race,
+     the inbox showed empty even though threads existed. Removed entirely. */
 
   /* password reset */
   const forgotHits = new Map();

@@ -93,7 +93,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v265-2026-07-15",fixes:["booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v267-2026-07-15",fixes:["routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
