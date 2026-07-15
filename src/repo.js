@@ -5,6 +5,17 @@
 import { usingPg, initDb, query } from "./db.js";
 import { load as memLoad, save as memSave, getDb, nextId } from "./store.js";
 
+// Message timestamps: date + time only (no seconds, no timezone name, no
+// weekday) — e.g. "Jul 15, 2026, 3:45 PM". Used for every thread message
+// sent to the frontend so vendor/customer chats show a clean, consistent
+// stamp instead of a raw ISO string.
+const fmtMsgTime = (v) => {
+  if (!v) return "";
+  const d = v instanceof Date ? v : new Date(v);
+  if (isNaN(d)) return "";
+  return d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+};
+
 /* ── row → API object mappers (snake_case columns → camelCase) ───────────── */
 const toUser = (r) => r && ({
   id: Number(r.id), role: r.role, email: r.email, passwordHash: r.password_hash,
@@ -696,7 +707,7 @@ export const repo = {
           // "me" must mean "whoever is currently looking at this" — not
           // hardcoded to one side. A vendor viewing their own inbox needs
           // their own replies to render as "me", not as the other party.
-          messages: msgs.map((m) => ({ from: m.sender_role === role ? "me" : m.sender_role, text: m.body, time: m.created_at })),
+          messages: msgs.map((m) => ({ from: m.sender_role === role ? "me" : m.sender_role, text: m.body, time: fmtMsgTime(m.created_at) })),
         });
       }
       return out;
@@ -712,7 +723,7 @@ export const repo = {
         customerName: customer ? `${customer.firstName || ""} ${customer.lastName || ""}`.trim() : "Customer",
         subject: t.subject, kind: t.kind,
         unread: msgs.some((m) => !m.read && m.senderRole !== role),
-        messages: msgs.map((m) => ({ from: m.senderRole === role ? "me" : m.senderRole, text: m.body, time: m.createdAt })),
+        messages: msgs.map((m) => ({ from: m.senderRole === role ? "me" : m.senderRole, text: m.body, time: fmtMsgTime(m.createdAt) })),
       };
     }).sort((a, b) => b.id.localeCompare(a.id));
   },
@@ -743,17 +754,37 @@ export const repo = {
   // ── bookings (free — no payment, confirmed immediately) ──────────────────
 
   async createBooking({ vendorId, customerId, customerName, eventDate, guests, location }) {
+    // Starts pending — the vendor must accept or decline before it's confirmed.
     if (usingPg) {
       const r = await query(
         `INSERT INTO bookings (vendor_id, customer_id, customer_name, event_date, guests, location, status)
-         VALUES ($1,$2,$3,$4,$5,$6,'confirmed') RETURNING *`,
+         VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *`,
         [vendorId, customerId, customerName || "", eventDate || null, guests || null, location || ""]);
       return r.rows[0];
     }
     const db = getDb();
     db.bookings = db.bookings || [];
-    const b = { id: nextId("booking"), vendorId, customerId, customerName: customerName || "", eventDate: eventDate || null, guests: guests || null, location: location || "", status: "confirmed", createdAt: new Date().toISOString() };
+    const b = { id: nextId("booking"), vendorId, customerId, customerName: customerName || "", eventDate: eventDate || null, guests: guests || null, location: location || "", status: "pending", createdAt: new Date().toISOString() };
     db.bookings.push(b); memSave(); return b;
+  },
+
+  // Vendor accepts or declines a pending booking request. Verifies the
+  // booking actually belongs to this vendor's own listing before updating,
+  // and returns the full row (incl. customer_id) so the caller can notify
+  // the customer by email.
+  async respondToBooking(bookingId, vendorId, decision) {
+    const rawId = String(bookingId).replace(/^bk/, "");
+    const status = decision === "accept" ? "confirmed" : "declined";
+    if (usingPg) {
+      const r = await query(
+        `UPDATE bookings SET status=$1 WHERE id=$2 AND vendor_id=$3 AND status='pending' RETURNING *`,
+        [status, rawId, vendorId]);
+      return r.rows[0] || null;
+    }
+    const db = getDb();
+    const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && String(x.vendorId) === String(vendorId) && x.status === "pending");
+    if (!b) return null;
+    b.status = status; memSave(); return b;
   },
 
   async listBookingsForVendor(vendorId) {

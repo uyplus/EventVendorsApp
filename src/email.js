@@ -73,6 +73,29 @@ export function sendNewMessageEmail(to, fromName, kind, link) {
   });
 }
 
+export function sendBookingRequestEmail(to, customerName, details, link) {
+  return send({
+    to, subject: `New Booking Request from ${customerName}`,
+    html: shell("You have a new booking request", `
+      <p><b>${customerName}</b> would like to book you${details ? ` — ${details}` : ""}.</p>
+      <p>Please accept or decline this request from your vendor dashboard. The customer will be notified either way.</p>
+      <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">Review booking request</a></p>`),
+  });
+}
+
+export function sendBookingDecisionEmail(to, vendorName, accepted, details, link) {
+  const verb = accepted ? "confirmed" : "declined";
+  return send({
+    to, subject: `Booking ${accepted ? "Confirmed" : "Declined"} — ${vendorName}`,
+    html: shell(accepted ? "Your booking is confirmed" : "Update on your booking request", `
+      <p><b>${vendorName}</b> has ${verb} your booking request${details ? ` — ${details}` : ""}.</p>
+      ${accepted
+        ? `<p>You can view the details any time from your account.</p>`
+        : `<p>You're welcome to reach out to other vendors in the same category — there are usually several great options.</p>`}
+      <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">View in account</a></p>`),
+  });
+}
+
 export function sendVerifyEmail(to, link, firstName) {
   const name = firstName || "there";
   return send({

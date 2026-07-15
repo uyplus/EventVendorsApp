@@ -22,7 +22,7 @@ import {
   sendVerifyEmail, sendWelcomeEmail, sendNewMessageEmail,
   sendContactEmail, sendReportNotificationEmail,
   sendLicenceVerifiedEmail, sendLicenceRejectedEmail,
-  sendClaimEmail,
+  sendClaimEmail, sendBookingRequestEmail, sendBookingDecisionEmail,
 } from "./email.js";
 import * as EMAILS from "./email.js";
 // Defensive: older copies of email.js may not export sendNotificationEmail.
@@ -610,17 +610,48 @@ app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 })
   const customerName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Customer";
   const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, eventDate: date || null, guests: guests || null, location: location || "" });
   // Drop a thread message too, so the booking shows up in the vendor's inbox as well as their bookings list.
-  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking confirmed", kind: "booking" }).catch(() => null);
-  const bookingText = `Booking confirmed${date ? ` for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}.`;
+  const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking request", kind: "booking" }).catch(() => null);
+  const details = `${date ? `for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}`.trim();
+  const bookingText = `New booking request${details ? " " + details : ""}. Please accept or decline from your vendor dashboard.`;
   if (thread) await repo.addThreadMessage(thread.id, "customer", bookingText).catch(() => {});
   (async () => {
     try {
       const vendor = await repo.findVendorById(vendorId);
       const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
-      if (vendorUser?.email) await sendNewMessageEmail(vendorUser.email, customerName, "message", `${APP_URL}/?inbox=1`);
+      if (vendorUser?.email) await sendBookingRequestEmail(vendorUser.email, customerName, details, `${APP_URL}/?inbox=1`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.status(201).json({ ok: true, id: "bk" + booking.id });
+}));
+
+app.post("/api/vendor/bookings/:id/accept", auth, requireVendor, h(async (req, res) => {
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const booking = await repo.respondToBooking(req.params.id, listing.id, "accept");
+  if (!booking) return res.status(404).json({ error: "Booking not found, already responded to, or doesn't belong to you." });
+  (async () => {
+    try {
+      const customer = await repo.findUserById(booking.customer_id ?? booking.customerId);
+      const details = `${(booking.event_date || booking.eventDate) ? `for ${booking.event_date || booking.eventDate}` : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
+      if (customer?.email) await sendBookingDecisionEmail(customer.email, listing.name, true, details, `${APP_URL}/?bookings=1`);
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
+  res.json({ ok: true });
+}));
+
+app.post("/api/vendor/bookings/:id/decline", auth, requireVendor, h(async (req, res) => {
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const booking = await repo.respondToBooking(req.params.id, listing.id, "decline");
+  if (!booking) return res.status(404).json({ error: "Booking not found, already responded to, or doesn't belong to you." });
+  (async () => {
+    try {
+      const customer = await repo.findUserById(booking.customer_id ?? booking.customerId);
+      const details = `${(booking.event_date || booking.eventDate) ? `for ${booking.event_date || booking.eventDate}` : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
+      if (customer?.email) await sendBookingDecisionEmail(customer.email, listing.name, false, details, `${APP_URL}/?bookings=1`);
+    } catch (e) { /* never block the request over a mail failure */ }
+  })();
+  res.json({ ok: true });
 }));
 
 app.get("/api/vendor/bookings", auth, requireVendor, h(async (req, res) => {
