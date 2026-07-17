@@ -93,7 +93,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v268-2026-07-15",fixes:["multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v272-2026-07-16",fixes:["booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
@@ -389,7 +389,7 @@ app.post("/api/quotes", rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(asyn
       });
       const lines = [
         "\ud83d\udccb Quote request",
-        b.eventDate ? `Event date: ${b.eventDate}` : null,
+        b.eventDate ? `Event date${b.endDate && b.endDate !== b.eventDate ? "s" : ""}: ${b.eventDate}${b.endDate && b.endDate !== b.eventDate ? " \u2192 " + b.endDate : ""}` : null,
         b.guests ? `Guests: ${b.guests}` : null,
         b.location ? `Location: ${b.location}` : null,
         b.budget ? `Budget: ${b.budget}` : null,
@@ -605,23 +605,53 @@ app.get("/api/vendor/enquiries/count", auth, requireVendor, h(async (req, res) =
 
 /* ── bookings — free, confirmed immediately, no payment involved ────────── */
 app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 }), h(async (req, res) => {
-  const { vendorId, date, guests, location } = req.body || {};
+  const { vendorId, date, endDate, guests, location, notes } = req.body || {};
   if (!vendorId) return res.status(400).json({ error: "vendorId is required." });
+  if (repo.ensureBookingTables) await repo.ensureBookingTables().catch(() => {});
   const customerName = `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Customer";
-  const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, eventDate: date || null, guests: guests || null, location: location || "" });
+  const booking = await repo.createBooking({ vendorId, customerId: req.user.id, customerName, customerEmail: req.user.email || "", eventDate: date || null, eventEndDate: endDate || null, guests: guests || null, location: location || "", notes: notes || "", source: "customer" });
   // Drop a thread message too, so the booking shows up in the vendor's inbox as well as their bookings list.
   const thread = await repo.getOrCreateThread({ vendorId, customerId: req.user.id, subject: "Booking request", kind: "booking" }).catch(() => null);
-  const details = `${date ? `for ${date}` : ""}${guests ? ` · ${guests} guests` : ""}${location ? ` · ${location}` : ""}`.trim();
-  const bookingText = `New booking request${details ? " " + details : ""}. Please accept or decline from your vendor dashboard.`;
+  const dateSpan = date ? (endDate && endDate !== date ? `for ${date} \u2192 ${endDate}` : `for ${date}`) : "";
+  const details = `${dateSpan}${guests ? ` \u00b7 ${guests} guests` : ""}${location ? ` \u00b7 ${location}` : ""}`.trim();
+  const bookingText = `New booking request${details ? " " + details : ""}${notes ? `\nNotes: ${notes}` : ""}\nPlease accept or decline from your vendor dashboard.`;
   if (thread) await repo.addThreadMessage(thread.id, "customer", bookingText).catch(() => {});
   (async () => {
     try {
       const vendor = await repo.findVendorById(vendorId);
       const vendorUser = vendor?.ownerUserId ? await repo.findUserById(vendor.ownerUserId) : null;
       if (vendorUser?.email) await sendBookingRequestEmail(vendorUser.email, customerName, details, `${APP_URL}/?inbox=1`);
+      if (vendorUser?.id) await repo.addNotification(vendorUser.id, `New booking request from ${customerName}${dateSpan ? " " + dateSpan : ""} \u2014 accept or decline from your dashboard.`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.status(201).json({ ok: true, id: "bk" + booking.id });
+}));
+
+/* ── manual jobs: the vendor's own organizer entries ─────────────────────
+   These live in the same bookings table (source='manual', confirmed
+   immediately) so "Upcoming jobs" is one chronological list of everything:
+   customer bookings the vendor accepted + jobs they added themselves. */
+app.post("/api/vendor/jobs", auth, requireVendor, h(async (req, res) => {
+  const { customerName, date, endDate, guests, location, notes } = req.body || {};
+  if (!customerName && !date) return res.status(400).json({ error: "Give the job at least a name or a date." });
+  const listing = await repo.findVendorByOwner(req.user.id);
+  if (!listing) return res.status(404).json({ error: "No vendor listing found for this account." });
+  if (repo.ensureBookingTables) await repo.ensureBookingTables().catch(() => {});
+  const job = await repo.createBooking({
+    vendorId: listing.id, customerId: null,
+    customerName: customerName || "Personal job", customerEmail: "",
+    eventDate: date || null, eventEndDate: endDate || null,
+    guests: guests || null, location: location || "", notes: notes || "", source: "manual"
+  });
+  res.status(201).json({ ok: true, id: "bk" + job.id });
+}));
+
+app.post("/api/vendor/jobs/:id/delete", auth, requireVendor, h(async (req, res) => {
+  const ownedIds = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ownedIds.length) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const ok = await repo.deleteManualJob(req.params.id, ownedIds);
+  if (!ok) return res.status(404).json({ error: "Job not found, not yours, or not a manually added job." });
+  res.json({ ok: true });
 }));
 
 app.post("/api/vendor/bookings/:id/accept", auth, requireVendor, h(async (req, res) => {
@@ -633,8 +663,10 @@ app.post("/api/vendor/bookings/:id/accept", auth, requireVendor, h(async (req, r
   (async () => {
     try {
       const customer = await repo.findUserById(booking.customer_id ?? booking.customerId);
-      const details = `${(booking.event_date || booking.eventDate) ? `for ${booking.event_date || booking.eventDate}` : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
+      const _d = booking.event_date || booking.eventDate, _e = booking.event_end_date || booking.eventEndDate;
+      const details = `${_d ? (_e && _e !== _d ? `for ${_d} \u2192 ${_e}` : `for ${_d}`) : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
       if (customer?.email) await sendBookingDecisionEmail(customer.email, listing.name, true, details, `${APP_URL}/?bookings=1`);
+      if (customer?.id) await repo.addNotification(customer.id, `${listing.name} accepted your booking request${details ? " " + details : ""}.`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.json({ ok: true });
@@ -649,8 +681,10 @@ app.post("/api/vendor/bookings/:id/decline", auth, requireVendor, h(async (req, 
   (async () => {
     try {
       const customer = await repo.findUserById(booking.customer_id ?? booking.customerId);
-      const details = `${(booking.event_date || booking.eventDate) ? `for ${booking.event_date || booking.eventDate}` : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
+      const _d = booking.event_date || booking.eventDate, _e = booking.event_end_date || booking.eventEndDate;
+      const details = `${_d ? (_e && _e !== _d ? `for ${_d} \u2192 ${_e}` : `for ${_d}`) : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
       if (customer?.email) await sendBookingDecisionEmail(customer.email, listing.name, false, details, `${APP_URL}/?bookings=1`);
+      if (customer?.id) await repo.addNotification(customer.id, `${listing.name} declined your booking request${details ? " " + details : ""}. You're welcome to try other vendors in the category.`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
   res.json({ ok: true });
@@ -775,6 +809,7 @@ const PORT = process.env.PORT || 4000;
   await repo.init();
   // Ensure thread_messages table exists (might be missing if schema_v7 was not run)
   if (repo.ensureMessagingTables) await repo.ensureMessagingTables().catch(e=>console.error("[startup] messaging table check:",e.message));
+  if (repo.ensureBookingTables) await repo.ensureBookingTables().catch(e=>console.error("[startup] booking table check:",e.message));
 
   await ensureSeeded();
   app.listen(PORT, () => console.log(`Event Vendors API running on http://localhost:${PORT}`));

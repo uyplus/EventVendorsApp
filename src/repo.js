@@ -766,19 +766,76 @@ export const repo = {
 
   // ── bookings (free — no payment, confirmed immediately) ──────────────────
 
-  async createBooking({ vendorId, customerId, customerName, eventDate, guests, location }) {
-    // Starts pending — the vendor must accept or decline before it's confirmed.
+  // Self-heal for the bookings table: production databases have gone through
+  // three incompatible booking schemas over time (customer_user_id vs
+  // customer_id, missing location/notes, hard FKs). This makes the current
+  // shape converge no matter which era created the table — same pattern as
+  // ensureMessagingTables, which fixed the identical failure mode for threads.
+  async ensureBookingTables() {
+    if (!usingPg) return;
+    await query(`CREATE TABLE IF NOT EXISTS bookings (
+      id BIGSERIAL PRIMARY KEY,
+      vendor_id BIGINT NOT NULL,
+      customer_id BIGINT,
+      customer_name TEXT DEFAULT '',
+      customer_email TEXT DEFAULT '',
+      event_date TEXT,
+      event_end_date TEXT,
+      guests INT,
+      location TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      source VARCHAR(16) NOT NULL DEFAULT 'customer',
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`).catch(() => {});
+    for (const col of ["customer_id BIGINT", "customer_name TEXT DEFAULT ''", "customer_email TEXT DEFAULT ''",
+      "event_end_date TEXT", "guests INT", "location TEXT DEFAULT ''", "notes TEXT DEFAULT ''",
+      "source VARCHAR(16) DEFAULT 'customer'", "status VARCHAR(20) DEFAULT 'pending'"]) {
+      await query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
+    }
+    // Old tables carried NOT NULLs and CHECKs incompatible with the new flow
+    for (const relax of ["customer_user_id", "amount", "event_date"]) {
+      await query(`ALTER TABLE bookings ALTER COLUMN ${relax} DROP NOT NULL`).catch(() => {});
+    }
+    await query(`ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check`).catch(() => {});
+    await query(`DO $$ DECLARE c RECORD; BEGIN
+      FOR c IN SELECT conname FROM pg_constraint
+        WHERE conrelid='bookings'::regclass AND contype='f' LOOP
+        EXECUTE 'ALTER TABLE bookings DROP CONSTRAINT ' || quote_ident(c.conname);
+      END LOOP; END $$`).catch(() => {});
+    await query('CREATE INDEX IF NOT EXISTS bookings_vendor_idx ON bookings(vendor_id)').catch(() => {});
+  },
+
+  async createBooking({ vendorId, customerId, customerName, customerEmail, eventDate, eventEndDate, guests, location, notes, source }) {
+    // Customer bookings start pending — the vendor must accept or decline.
+    // Manual jobs the vendor adds for themselves are confirmed immediately.
+    const status = source === "manual" ? "confirmed" : "pending";
     if (usingPg) {
-      const r = await query(
-        `INSERT INTO bookings (vendor_id, customer_id, customer_name, event_date, guests, location, status)
-         VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *`,
-        [vendorId, customerId, customerName || "", eventDate || null, guests || null, location || ""]);
-      return r.rows[0];
+      const attempt = () => query(
+        `INSERT INTO bookings (vendor_id, customer_id, customer_name, customer_email, event_date, event_end_date, guests, location, notes, source, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+        [vendorId, customerId ?? null, customerName || "", customerEmail || "", eventDate || null, eventEndDate || null, guests || null, location || "", notes || "", source || "customer", status]);
+      try { return (await attempt()).rows[0]; }
+      catch (e) {
+        // Missing column / stale constraint from an old-era table — heal and retry once.
+        await this.ensureBookingTables().catch(() => {});
+        return (await attempt()).rows[0];
+      }
     }
     const db = getDb();
     db.bookings = db.bookings || [];
-    const b = { id: nextId("booking"), vendorId, customerId, customerName: customerName || "", eventDate: eventDate || null, guests: guests || null, location: location || "", status: "pending", createdAt: new Date().toISOString() };
+    const b = { id: nextId("booking"), vendorId, customerId: customerId ?? null, customerName: customerName || "", customerEmail: customerEmail || "", eventDate: eventDate || null, eventEndDate: eventEndDate || null, guests: guests || null, location: location || "", notes: notes || "", source: source || "customer", status, createdAt: new Date().toISOString() };
     db.bookings.push(b); memSave(); return b;
+  },
+
+  // Bell notifications (works alongside the email notifications)
+  async addNotification(userId, body) {
+    if (!userId) return;
+    if (usingPg) { await query("INSERT INTO notifications (user_id, body) VALUES ($1,$2)", [userId, body]).catch(() => {}); return; }
+    const db = getDb();
+    db.notifications = db.notifications || [];
+    db.notifications.push({ id: nextId("notification"), userId, body, read: false, createdAt: new Date().toISOString() });
+    memSave();
   },
 
   // Vendor accepts or declines a pending booking request. Verifies the
@@ -801,28 +858,45 @@ export const repo = {
     b.status = status; memSave(); return b;
   },
 
+  // Only manually-added jobs can be deleted this way — customer bookings must
+  // go through the accept/decline flow so both parties stay informed.
+  async deleteManualJob(jobId, vendorIds) {
+    const rawId = String(jobId).replace(/^bk/, "");
+    const ids = (Array.isArray(vendorIds) ? vendorIds : [vendorIds]).filter((x) => x != null);
+    if (usingPg) {
+      const r = await query(
+        `DELETE FROM bookings WHERE id=$1 AND vendor_id=ANY($2) AND source='manual' RETURNING id`,
+        [rawId, ids]);
+      return !!r.rows[0];
+    }
+    const db = getDb();
+    const i = (db.bookings || []).findIndex((x) => String(x.id) === String(rawId) && ids.some((vid) => String(vid) === String(x.vendorId)) && x.source === "manual");
+    if (i < 0) return false;
+    db.bookings.splice(i, 1); memSave(); return true;
+  },
+
   async listBookingsForVendor(vendorId) {
     // vendorId may be a single id or an array — span every listing this
     // vendor owns (see findVendorIdsByOwner for why duplicates can exist).
     const ids = (Array.isArray(vendorId) ? vendorId : [vendorId]).filter((x) => x != null);
     if (usingPg) {
       const r = await query(`SELECT * FROM bookings WHERE vendor_id=ANY($1) ORDER BY event_date ASC NULLS LAST, created_at DESC`, [ids]);
-      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, customerName: b.customer_name, date: b.event_date, guests: b.guests, location: b.location, status: b.status }));
+      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, customerName: b.customer_name, customerEmail: b.status === "confirmed" ? (b.customer_email || "") : "", date: b.event_date, endDate: b.event_end_date, guests: b.guests, location: b.location, notes: b.notes || "", source: b.source || "customer", status: b.status }));
     }
     const db = getDb();
     return (db.bookings || []).filter((b) => ids.some((vid) => String(vid) === String(b.vendorId)))
-      .map((b) => ({ id: "bk" + b.id, vendorId: b.vendorId, customerName: b.customerName, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }));
+      .map((b) => ({ id: "bk" + b.id, vendorId: b.vendorId, customerName: b.customerName, customerEmail: b.status === "confirmed" ? (b.customerEmail || "") : "", date: b.eventDate, endDate: b.eventEndDate, guests: b.guests, location: b.location, notes: b.notes || "", source: b.source || "customer", status: b.status }));
   },
 
   async listBookingsForCustomer(customerId) {
     if (usingPg) {
       const r = await query(
         `SELECT b.*, v.name AS vendor_name FROM bookings b JOIN vendors v ON v.id = b.vendor_id WHERE b.customer_id=$1 ORDER BY b.event_date ASC NULLS LAST`, [customerId]);
-      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, vendorName: b.vendor_name, date: b.event_date, guests: b.guests, location: b.location, status: b.status }));
+      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, vendorName: b.vendor_name, date: b.event_date, endDate: b.event_end_date, guests: b.guests, location: b.location, status: b.status }));
     }
     const db = getDb();
     return (db.bookings || []).filter((b) => b.customerId === customerId)
-      .map((b) => { const v = (db.vendors || []).find((x) => x.id === b.vendorId); return { id: "bk" + b.id, vendorId: b.vendorId, vendorName: v?.name, date: b.eventDate, guests: b.guests, location: b.location, status: b.status }; });
+      .map((b) => { const v = (db.vendors || []).find((x) => x.id === b.vendorId); return { id: "bk" + b.id, vendorId: b.vendorId, vendorName: v?.name, date: b.eventDate, endDate: b.eventEndDate, guests: b.guests, location: b.location, status: b.status }; });
   },
 
   // Cancelling sets status rather than deleting — keeps a record, and frees
