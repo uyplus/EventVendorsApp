@@ -31,6 +31,7 @@ const sendNotificationEmail = EMAILS.sendNotificationEmail || (async () => {});
 const emailModule = { sendClaimEmail };
 
 const APP_URL = process.env.APP_URL || process.env.CORS_ORIGIN || "https://eventvendors.us";
+const API_SELF_URL = process.env.API_SELF_URL || "https://event-vendors-api.onrender.com";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -93,7 +94,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v272-2026-07-16",fixes:["booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v273-2026-07-17",fixes:["ics-calendar-feed","add-to-calendar-links","booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
@@ -627,6 +628,60 @@ app.post("/api/bookings", auth, rateLimit({ windowMs: 60 * 60 * 1000, max: 30 })
   res.status(201).json({ ok: true, id: "bk" + booking.id });
 }));
 
+/* ── calendar sync (ICS feed subscription) ───────────────────────────────
+   Vendors (and customers) get a private tokenized .ics URL they subscribe
+   to from Google Calendar ("Other calendars → From URL"), Outlook ("Add
+   calendar → Subscribe from web") or Apple Calendar. The external calendar
+   then refreshes itself on the provider's schedule, so confirmed bookings
+   appear and stay updated automatically — no OAuth, revocable by rotating
+   the token. */
+app.get("/api/calendar-token", auth, h(async (req, res) => {
+  const token = await repo.getOrCreateCalendarToken(req.user.id);
+  if (!token) return res.status(500).json({ error: "Could not create a calendar link." });
+  res.json({ token, url: `${API_SELF_URL}/api/calendar/${token}.ics` });
+}));
+
+const icsEscape = (s) => String(s || "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+const icsDate = (d) => String(d).replace(/-/g, "");
+const icsNextDay = (d) => { const x = new Date(d + "T00:00:00Z"); x.setUTCDate(x.getUTCDate() + 1); return x.toISOString().slice(0, 10).replace(/-/g, ""); };
+
+app.get("/api/calendar/:token.ics", h(async (req, res) => {
+  const user = await repo.findUserByCalendarToken(req.params.token);
+  if (!user) return res.status(404).send("Not found");
+  let bookings = [];
+  if (user.role === "vendor") {
+    const ids = await repo.findVendorIdsByOwner(user.id);
+    if (ids.length) bookings = await repo.listBookingsForVendor(ids);
+  } else {
+    bookings = await repo.listBookingsForCustomer(user.id);
+  }
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const lines = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//EventVendors//Bookings//EN",
+    "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+    `X-WR-CALNAME:Event Vendors \u2014 ${icsEscape(user.role === "vendor" ? (user.businessName || "My bookings") : "My bookings")}`,
+  ];
+  for (const b of bookings) {
+    if (b.status !== "confirmed" || !b.date) continue;
+    const who = user.role === "vendor" ? (b.customerName || "Booking") : (b.vendorName || "Booking");
+    lines.push(
+      "BEGIN:VEVENT",
+      `UID:${String(b.id)}@eventvendors.us`,
+      `DTSTAMP:${stamp}`,
+      `DTSTART;VALUE=DATE:${icsDate(b.date)}`,
+      `DTEND;VALUE=DATE:${b.endDate && b.endDate !== b.date ? icsNextDay(b.endDate) : icsNextDay(b.date)}`,
+      `SUMMARY:${icsEscape(who)}${b.guests ? icsEscape(` \u00b7 ${b.guests} guests`) : ""}`,
+      b.location ? `LOCATION:${icsEscape(b.location)}` : null,
+      `DESCRIPTION:${icsEscape((b.notes ? b.notes + "\n" : "") + "Booked via Event Vendors")}`,
+      "END:VEVENT"
+    );
+  }
+  lines.push("END:VCALENDAR");
+  res.set("Content-Type", "text/calendar; charset=utf-8");
+  res.set("Content-Disposition", 'inline; filename="eventvendors.ics"');
+  res.send(lines.filter(Boolean).join("\r\n"));
+}));
+
 /* ── manual jobs: the vendor's own organizer entries ─────────────────────
    These live in the same bookings table (source='manual', confirmed
    immediately) so "Upcoming jobs" is one chronological list of everything:
@@ -665,7 +720,19 @@ app.post("/api/vendor/bookings/:id/accept", auth, requireVendor, h(async (req, r
       const customer = await repo.findUserById(booking.customer_id ?? booking.customerId);
       const _d = booking.event_date || booking.eventDate, _e = booking.event_end_date || booking.eventEndDate;
       const details = `${_d ? (_e && _e !== _d ? `for ${_d} \u2192 ${_e}` : `for ${_d}`) : ""}${booking.guests ? ` · ${booking.guests} guests` : ""}`.trim();
-      if (customer?.email) await sendBookingDecisionEmail(customer.email, listing.name, true, details, `${APP_URL}/?bookings=1`);
+      let cal = null;
+      if (_d) {
+        const s = String(_d).replace(/-/g, ""), lastDay = _e && _e !== _d ? _e : _d;
+        const eNext = (() => { const x = new Date(lastDay + "T00:00:00Z"); x.setUTCDate(x.getUTCDate() + 1); return x.toISOString().slice(0, 10); })();
+        const title = encodeURIComponent(`${listing.name} — Event Vendors booking`);
+        const loc = encodeURIComponent(booking.location || "");
+        cal = {
+          start: _d,
+          google: `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${title}&dates=${s}/${eNext.replace(/-/g, "")}&location=${loc}`,
+          outlook: `https://outlook.live.com/calendar/0/action/compose?rru=addevent&subject=${title}&startdt=${_d}&enddt=${eNext}&allday=true&location=${loc}`
+        };
+      }
+      if (customer?.email) await sendBookingDecisionEmail(customer.email, listing.name, true, details, `${APP_URL}/?bookings=1`, cal);
       if (customer?.id) await repo.addNotification(customer.id, `${listing.name} accepted your booking request${details ? " " + details : ""}.`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();

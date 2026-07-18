@@ -83,14 +83,19 @@ export function sendBookingRequestEmail(to, customerName, details, link) {
   });
 }
 
-export function sendBookingDecisionEmail(to, vendorName, accepted, details, link) {
+export function sendBookingDecisionEmail(to, vendorName, accepted, details, link, cal) {
   const verb = accepted ? "confirmed" : "declined";
+  const calRow = accepted && cal && cal.start ? `
+      <p style="margin-top:14px">
+        <a href="${cal.google}" style="color:#3B2C4F;font-weight:bold;margin-right:16px">+ Google Calendar</a>
+        <a href="${cal.outlook}" style="color:#3B2C4F;font-weight:bold">+ Outlook</a>
+      </p>` : "";
   return send({
     to, subject: `Booking ${accepted ? "Confirmed" : "Declined"} — ${vendorName}`,
     html: shell(accepted ? "Your booking is confirmed" : "Update on your booking request", `
       <p><b>${vendorName}</b> has ${verb} your booking request${details ? ` — ${details}` : ""}.</p>
       ${accepted
-        ? `<p>You can view the details any time from your account.</p>`
+        ? `<p>You can view the details any time from your account.</p>${calRow}`
         : `<p>You're welcome to reach out to other vendors in the same category — there are usually several great options.</p>`}
       <p><a href="${link}" style="background:#3B2C4F;color:#fff;padding:11px 20px;border-radius:10px;text-decoration:none;display:inline-block">View in account</a></p>`),
   });

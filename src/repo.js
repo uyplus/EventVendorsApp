@@ -2,6 +2,7 @@
 // When DATABASE_URL is set it runs parameterised SQL against Postgres;
 // otherwise it falls back to the JSON file store (src/store.js) for local dev.
 
+import { randomBytes } from "crypto";
 import { usingPg, initDb, query } from "./db.js";
 import { load as memLoad, save as memSave, getDb, nextId } from "./store.js";
 
@@ -106,6 +107,39 @@ export const repo = {
   async findUserById(id) {
     if (usingPg) return toUser((await query("SELECT * FROM users WHERE id=$1", [id])).rows[0]) || null;
     return getDb().users.find((u) => String(u.id) === String(id)) || null;
+  },
+
+  /* ── calendar feed tokens ──────────────────────────────────────────────
+     Each user gets one unguessable token; GET /api/calendar/:token.ics is
+     authenticated BY the token itself (standard for calendar-subscription
+     URLs — Google/Outlook fetch them unauthenticated on a schedule). */
+  async ensureCalendarColumn() {
+    if (!usingPg) return;
+    await query("ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_token TEXT").catch(() => {});
+  },
+
+  async getOrCreateCalendarToken(userId) {
+    const tok = randomBytes(24).toString("hex");
+    if (usingPg) {
+      await this.ensureCalendarColumn();
+      const cur = (await query("SELECT calendar_token FROM users WHERE id=$1", [userId])).rows[0];
+      if (cur?.calendar_token) return cur.calendar_token;
+      await query("UPDATE users SET calendar_token=$1 WHERE id=$2", [tok, userId]);
+      return tok;
+    }
+    const u = getDb().users.find((x) => String(x.id) === String(userId));
+    if (!u) return null;
+    if (!u.calendarToken) { u.calendarToken = tok; memSave(); }
+    return u.calendarToken;
+  },
+
+  async findUserByCalendarToken(token) {
+    if (!token) return null;
+    if (usingPg) {
+      await this.ensureCalendarColumn();
+      return toUser((await query("SELECT * FROM users WHERE calendar_token=$1", [token])).rows[0]) || null;
+    }
+    return getDb().users.find((u) => u.calendarToken === token) || null;
   },
 
   // Password reset lives in features.js (password_reset_tokens table,
