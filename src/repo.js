@@ -270,13 +270,81 @@ export const repo = {
     return getDb().vendors.filter((v) => v.premiumTier === "founding").length;
   },
 
+  /* ── customer reviews — vendors rating customers they've actually dealt
+     with, so risky/fraudulent customers can be flagged for other vendors.
+     Deliberately ANONYMOUS in aggregate (no vendor names exposed) to avoid
+     retaliation, and gated on a real booking existing between the two
+     parties to prevent abuse. ─────────────────────────────────────────── */
+  async ensureCustomerReviewTable() {
+    if (!usingPg) return;
+    await query(`CREATE TABLE IF NOT EXISTS customer_reviews (
+      id BIGSERIAL PRIMARY KEY,
+      vendor_id BIGINT NOT NULL,
+      customer_id BIGINT NOT NULL,
+      rating INT NOT NULL,
+      flag VARCHAR(24) NOT NULL DEFAULT 'normal',
+      notes TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(vendor_id, customer_id)
+    )`).catch(() => {});
+  },
+
+  // Only allow a vendor to review a customer they've actually had a booking
+  // with — this is the anti-abuse gate for the whole feature.
+  async hasBookingBetween(vendorIds, customerId) {
+    const ids = (Array.isArray(vendorIds) ? vendorIds : [vendorIds]).filter((x) => x != null);
+    if (usingPg) {
+      const r = await query(`SELECT 1 FROM bookings WHERE vendor_id=ANY($1) AND customer_id=$2 LIMIT 1`, [ids, customerId]);
+      return r.rows.length > 0;
+    }
+    return (getDb().bookings || []).some((b) => ids.some((v) => String(v) === String(b.vendorId)) && String(b.customerId) === String(customerId));
+  },
+
+  async createCustomerReview(vendorId, customerId, rating, flag, notes) {
+    if (usingPg) {
+      await this.ensureCustomerReviewTable();
+      const r = await query(
+        `INSERT INTO customer_reviews (vendor_id, customer_id, rating, flag, notes)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (vendor_id, customer_id) DO UPDATE SET rating=$3, flag=$4, notes=$5, created_at=now()
+         RETURNING id`,
+        [vendorId, customerId, rating, flag || "normal", (notes || "").slice(0, 500)]);
+      return r.rows[0].id;
+    }
+    const db = getDb();
+    db.customerReviews = db.customerReviews || [];
+    const existing = db.customerReviews.find((x) => String(x.vendorId) === String(vendorId) && String(x.customerId) === String(customerId));
+    if (existing) { Object.assign(existing, { rating, flag: flag || "normal", notes: (notes || "").slice(0, 500), createdAt: new Date().toISOString() }); memSave(); return existing.id; }
+    const row = { id: nextId("customerReview"), vendorId, customerId, rating, flag: flag || "normal", notes: (notes || "").slice(0, 500), createdAt: new Date().toISOString() };
+    db.customerReviews.push(row); memSave(); return row.id;
+  },
+
+  // Aggregate-only summary for a customer: counts by flag + average rating,
+  // never exposes which vendor said what.
+  async getCustomerRiskSummary(customerId) {
+    if (usingPg) {
+      await this.ensureCustomerReviewTable();
+      const r = await query(`SELECT flag, COUNT(*)::int AS n, AVG(rating)::numeric(3,2) AS avg FROM customer_reviews WHERE customer_id=$1 GROUP BY flag`, [customerId]);
+      const total = r.rows.reduce((s, x) => s + x.n, 0);
+      const flags = Object.fromEntries(r.rows.map((x) => [x.flag, x.n]));
+      const avgRow = await query(`SELECT AVG(rating)::numeric(3,2) AS avg FROM customer_reviews WHERE customer_id=$1`, [customerId]);
+      return { total, flags, avgRating: total > 0 ? parseFloat(avgRow.rows[0].avg) : null };
+    }
+    const mine = (getDb().customerReviews || []).filter((x) => String(x.customerId) === String(customerId));
+    const flags = {};
+    for (const r of mine) flags[r.flag] = (flags[r.flag] || 0) + 1;
+    return { total: mine.length, flags, avgRating: mine.length ? Math.round((mine.reduce((s, r) => s + r.rating, 0) / mine.length) * 100) / 100 : null };
+  },
+
   /* ── reviews — real, persisted; vendor rating/count recompute live ────── */
 
   async createReview(vendorId, customerId, authorName, rating, body, thumbs) {
     if (usingPg) {
       try {
-        await query(
-          `INSERT INTO reviews (vendor_id, customer_id, author_name, rating, body, thumbs) VALUES ($1,$2,$3,$4,$5,$6)`,
+        await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vendor_reply TEXT`).catch(() => {});
+        await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vendor_reply_at TIMESTAMPTZ`).catch(() => {});
+        const ins = await query(
+          `INSERT INTO reviews (vendor_id, customer_id, author_name, rating, body, thumbs) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
           [vendorId, customerId || null, authorName || "Guest", rating, body || "", thumbs || null]);
         // Recompute the vendor's aggregate rating/count/thumbs from real reviews —
         // this is what makes the counters genuinely live, not frozen seed numbers.
@@ -285,7 +353,7 @@ export const repo = {
           FROM reviews WHERE vendor_id=$1`, [vendorId]);
         const { n, avg, up, down } = agg.rows[0];
         await query(`UPDATE vendors SET reviews=$2, rating=$3, thumbs_up=$4, thumbs_down=$5 WHERE id=$1`, [vendorId, n, avg, up, down]);
-        return { count: n, rating: parseFloat(avg), thumbsUp: up, thumbsDown: down };
+        return { id: ins.rows[0].id, count: n, rating: parseFloat(avg), thumbsUp: up, thumbsDown: down };
       } catch (e) {
         if (!/relation .* does not exist/i.test(e.message) && !/column .* does not exist/i.test(e.message)) throw e;
         console.error("[repo] createReview: reviews table/columns missing — run schema_v9.sql and schema_v10.sql in Supabase. Review was not saved. Detail:", e.message);
@@ -294,7 +362,8 @@ export const repo = {
     }
     const db = getDb();
     db.reviews = db.reviews || [];
-    db.reviews.push({ id: nextId("review"), vendorId, customerId: customerId || null, authorName: authorName || "Guest", rating, body: body || "", thumbs: thumbs || null, createdAt: new Date().toISOString() });
+    const row = { id: nextId("review"), vendorId, customerId: customerId || null, authorName: authorName || "Guest", rating, body: body || "", thumbs: thumbs || null, vendorReply: null, vendorReplyAt: null, createdAt: new Date().toISOString() };
+    db.reviews.push(row);
     const mine = db.reviews.filter((r) => r.vendorId === vendorId);
     const avg = mine.reduce((s, r) => s + r.rating, 0) / mine.length;
     const up = mine.filter((r) => r.thumbs === "up").length;
@@ -302,20 +371,41 @@ export const repo = {
     const v = db.vendors.find((x) => x.id === vendorId);
     if (v) { v.reviews = mine.length; v.rating = Math.round(avg * 100) / 100; v.thumbsUp = up; v.thumbsDown = down; }
     memSave();
-    return { count: mine.length, rating: Math.round(avg * 100) / 100, thumbsUp: up, thumbsDown: down };
+    return { id: row.id, count: mine.length, rating: Math.round(avg * 100) / 100, thumbsUp: up, thumbsDown: down };
+  },
+
+  // Vendor's reply to a review — verifies the review actually belongs to one
+  // of THIS vendor's own listings before allowing the reply.
+  async respondToReview(reviewId, vendorIds, replyText) {
+    const ids = (Array.isArray(vendorIds) ? vendorIds : [vendorIds]).filter((x) => x != null);
+    if (usingPg) {
+      await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vendor_reply TEXT`).catch(() => {});
+      await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vendor_reply_at TIMESTAMPTZ`).catch(() => {});
+      const r = await query(
+        `UPDATE reviews SET vendor_reply=$1, vendor_reply_at=now() WHERE id=$2 AND vendor_id=ANY($3) RETURNING *`,
+        [replyText, reviewId, ids]);
+      return r.rows[0] || null;
+    }
+    const db = getDb();
+    const row = (db.reviews || []).find((x) => String(x.id) === String(reviewId) && ids.some((vid) => String(vid) === String(x.vendorId)));
+    if (!row) return null;
+    row.vendorReply = replyText; row.vendorReplyAt = new Date().toISOString();
+    memSave(); return row;
   },
 
   async listReviewsForVendor(vendorId) {
     if (usingPg) {
       try {
+        await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vendor_reply TEXT`).catch(() => {});
+        await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS vendor_reply_at TIMESTAMPTZ`).catch(() => {});
         const r = await query(`SELECT * FROM reviews WHERE vendor_id=$1 ORDER BY created_at DESC`, [vendorId]);
-        return r.rows.map((x) => ({ author: x.author_name, rating: x.rating, text: x.body, date: new Date(x.created_at).toLocaleDateString(), thumbs: x.thumbs || null }));
+        return r.rows.map((x) => ({ id: x.id, customerId: x.customer_id, author: x.author_name, rating: x.rating, text: x.body, date: new Date(x.created_at).toLocaleDateString(), thumbs: x.thumbs || null, vendorReply: x.vendor_reply || null, vendorReplyDate: x.vendor_reply_at ? new Date(x.vendor_reply_at).toLocaleDateString() : null }));
       } catch (e) { return []; }
     }
     const db = getDb();
     return (db.reviews || []).filter((r) => r.vendorId === vendorId)
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      .map((r) => ({ author: r.authorName, rating: r.rating, text: r.body, date: new Date(r.createdAt).toLocaleDateString(), thumbs: r.thumbs || null }));
+      .map((r) => ({ id: r.id, customerId: r.customerId, author: r.authorName, rating: r.rating, text: r.body, date: new Date(r.createdAt).toLocaleDateString(), thumbs: r.thumbs || null, vendorReply: r.vendorReply || null, vendorReplyDate: r.vendorReplyAt ? new Date(r.vendorReplyAt).toLocaleDateString() : null }));
   },
 
   /* ── response time — computed from real message timestamps ────────────

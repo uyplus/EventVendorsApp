@@ -94,7 +94,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v273-2026-07-17",fixes:["ics-calendar-feed","add-to-calendar-links","booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v278-2026-07-20",fixes:["review-reply-notify","customer-risk-flagging","review-reporting","booking-rate-metric","about-save-ordering-fix","distance-select-options-fix","ics-calendar-feed","add-to-calendar-links","booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
@@ -358,7 +358,48 @@ app.post("/api/vendors/:id/reviews", auth, rateLimit({ windowMs: 60 * 60 * 1000,
   const authorName = author || `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim() || "Guest";
   const stats = await repo.createReview(req.params.id, req.user.id, authorName, r, (text || "").slice(0, 1000), thumbs || null);
   if (!stats) return res.status(503).json({ error: "Reviews aren't set up on the server yet." });
+  (async () => {
+    try {
+      const vendor = await repo.findVendorById(req.params.id);
+      if (vendor?.ownerUserId) {
+        await repo.addNotification(vendor.ownerUserId, `${authorName} left you a ${r}-star review${text ? ` — "${text.slice(0, 60)}${text.length > 60 ? "…" : ""}"` : ""}. Tap to view and reply.`);
+      }
+    } catch (e) { /* never block the request over a notification failure */ }
+  })();
   res.status(201).json({ ok: true, ...stats });
+}));
+
+app.post("/api/vendor/reviews/:id/reply", auth, requireVendor, h(async (req, res) => {
+  const { text } = req.body || {};
+  if (!text || !text.trim()) return res.status(400).json({ error: "Reply text is required." });
+  const ownedIds = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ownedIds.length) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const review = await repo.respondToReview(req.params.id, ownedIds, text.slice(0, 1000));
+  if (!review) return res.status(404).json({ error: "Review not found or doesn't belong to your listing." });
+  res.json({ ok: true });
+}));
+
+/* ── customer reviews (vendors rating customers) ──────────────────────── */
+app.post("/api/vendor/customer-reviews", auth, requireVendor, rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(async (req, res) => {
+  const { customerId, rating, flag, notes } = req.body || {};
+  const r = parseInt(rating);
+  if (!customerId) return res.status(400).json({ error: "customerId is required." });
+  if (!r || r < 1 || r > 5) return res.status(400).json({ error: "rating must be 1-5." });
+  const allowedFlags = ["normal", "high_risk", "repeat_no_show", "fraud_suspected"];
+  if (flag && !allowedFlags.includes(flag)) return res.status(400).json({ error: `flag must be one of: ${allowedFlags.join(", ")}` });
+  const ownedIds = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ownedIds.length) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const hadBooking = await repo.hasBookingBetween(ownedIds, customerId);
+  if (!hadBooking) return res.status(403).json({ error: "You can only review customers you've had a booking with." });
+  const id = await repo.createCustomerReview(ownedIds[0], customerId, r, flag || "normal", notes || "");
+  res.status(201).json({ ok: true, id });
+}));
+
+// Any vendor can check a customer's aggregate risk summary before engaging —
+// deliberately returns counts only, never who flagged them.
+app.get("/api/vendor/customers/:id/risk-summary", auth, requireVendor, h(async (req, res) => {
+  const summary = await repo.getCustomerRiskSummary(req.params.id);
+  res.json(summary);
 }));
 
 /* ── quotes ────────────────────────────────────────────────────────────── */
@@ -806,9 +847,10 @@ app.post("/api/billing/webhook", (req, res) => res.status(410).json({ error: "Bi
 app.post("/api/reports", rateLimit({ windowMs: 60 * 60 * 1000, max: 20 }), h(async (req, res) => {
   const b = req.body || {};
   if (!b.vendorId && !b.userId) return res.status(400).json({ error: "vendorId or userId is required." });
-  const id = await repo.createReport({ vendorId: b.vendorId, userId: b.userId, reason: (b.reason || "").slice(0, 1000), reasons: Array.isArray(b.reasons) ? b.reasons.slice(0, 12) : [], reporterEmail: b.reporterEmail || "" });
+  const reasonText = (b.reviewId ? `[Review #${b.reviewId}] ` : "") + (b.reason || "");
+  const id = await repo.createReport({ vendorId: b.vendorId, userId: b.userId, reason: reasonText.slice(0, 1000), reasons: Array.isArray(b.reasons) ? b.reasons.slice(0, 12) : [], reporterEmail: b.reporterEmail || "" });
   // Notify the admin team immediately — reports should never sit unseen in the database.
-  sendReportNotificationEmail({ vendorId: b.vendorId, userId: b.userId, reasons: b.reasons, reason: b.reason, reporterEmail: b.reporterEmail }).catch((e) => console.error("[reports] notification email failed:", e.message));
+  sendReportNotificationEmail({ vendorId: b.vendorId, userId: b.userId, reasons: b.reasons, reason: reasonText, reporterEmail: b.reporterEmail }).catch((e) => console.error("[reports] notification email failed:", e.message));
   res.status(201).json({ ok: true, id });
 }));
 
