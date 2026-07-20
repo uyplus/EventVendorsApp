@@ -94,7 +94,7 @@ app.get("/api/health/messaging", h(async (req, res) => {
   }
 }));
 
-app.get("/api/version", (req,res)=>res.json({version:"v278-2026-07-20",fixes:["review-reply-notify","customer-risk-flagging","review-reporting","booking-rate-metric","about-save-ordering-fix","distance-select-options-fix","ics-calendar-feed","add-to-calendar-links","booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
+app.get("/api/version", (req,res)=>res.json({version:"v279-2026-07-20",fixes:["conversion-rate-tracking","profile-view-counter","review-reply-notify","customer-risk-flagging","review-reporting","booking-rate-metric","about-save-ordering-fix","distance-select-options-fix","ics-calendar-feed","add-to-calendar-links","booking-date-ranges","manual-vendor-jobs","bookings-table-self-heal","bell-notifications","multi-listing-vendor-lookup","routes-deduped-features","quote-inbox-thread","booking-accept-decline","booking-request-email","booking-decision-email","booking-pending-status","msg-timestamp-format","messaging-self-heal","threads-table-autocreate","fk-drop-demo-vendors","messaging-route-deduped","role-enforcement","listing-prepopulate","compliance-vendor-media"],usingPg}));
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 app.get("/api/categories", (req, res) => res.json({ categories: CATEGORIES, licenseByOffering: LICENSE_BY_OFFERING, cuisines: CUISINE_OPTIONS }));
@@ -343,6 +343,7 @@ app.get("/api/vendors", h(async (req, res) => {
 app.get("/api/vendors/:id", h(async (req, res) => {
   const v = await repo.findVendorById(req.params.id);
   if (!v) return res.status(404).json({ error: "Vendor not found" });
+  repo.incrementProfileViews(req.params.id).catch(() => {});
   res.json(v);
 }));
 
@@ -795,6 +796,20 @@ app.post("/api/vendor/bookings/:id/decline", auth, requireVendor, h(async (req, 
       if (customer?.id) await repo.addNotification(customer.id, `${listing.name} declined your booking request${details ? " " + details : ""}. You're welcome to try other vendors in the category.`);
     } catch (e) { /* never block the request over a mail failure */ }
   })();
+  res.json({ ok: true });
+}));
+
+// The vendor's own post-event confirmation — this is what "conversion rate"
+// is actually built from. There's no payment processing on this platform to
+// verify completion automatically, so this self-report is the real source
+// of truth for whether an accepted booking turned into actual business.
+app.post("/api/vendor/bookings/:id/complete", auth, requireVendor, h(async (req, res) => {
+  const { completed } = req.body || {};
+  if (typeof completed !== "boolean") return res.status(400).json({ error: "completed (true/false) is required." });
+  const ownedIds = await repo.findVendorIdsByOwner(req.user.id);
+  if (!ownedIds.length) return res.status(404).json({ error: "No vendor listing found for this account." });
+  const booking = await repo.markBookingCompletion(req.params.id, ownedIds, completed);
+  if (!booking) return res.status(404).json({ error: "Booking not found, not confirmed, or doesn't belong to you." });
   res.json({ ok: true });
 }));
 

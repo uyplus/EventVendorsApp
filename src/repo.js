@@ -33,6 +33,7 @@ const toVendor = (r) => r && ({
   city: r.city, region: r.region, country: r.country, distance: r.distance,
   rating: Number(r.rating), reviews: r.reviews, premium: r.premium, sponsored: r.sponsored,
   thumbsUp: r.thumbs_up || 0, thumbsDown: r.thumbs_down || 0,
+  profileViews: r.profile_views || 0,
   premiumTier: r.premium_tier || null,
   premiumSince: r.premium_since || null,
   premiumExpiresAt: r.premium_expires_at || null,
@@ -532,6 +533,19 @@ export const repo = {
     return getDb().vendors.find((v) => String(v.id) === String(id)) || null;
   },
 
+  // Simple, honest view counter: incremented once per detail-page fetch.
+  // Not bot-proofed or de-duplicated by session — that's a deliberate scope
+  // choice, matching how most small marketplaces count this.
+  async incrementProfileViews(id) {
+    if (!usingPg) {
+      const v = getDb().vendors.find((x) => String(x.id) === String(id));
+      if (v) { v.profileViews = (v.profileViews || 0) + 1; memSave(); }
+      return;
+    }
+    await query(`ALTER TABLE vendors ADD COLUMN IF NOT EXISTS profile_views INT NOT NULL DEFAULT 0`).catch(() => {});
+    await query(`UPDATE vendors SET profile_views = profile_views + 1 WHERE id=$1`, [id]).catch(() => {});
+  },
+
   async findVendorByOwner(userId) {
     if (usingPg) return toVendor((await query("SELECT * FROM vendors WHERE owner_user_id=$1 ORDER BY id DESC LIMIT 1", [userId])).rows[0]) || null;
     return getDb().vendors.find((v) => String(v.ownerUserId) === String(userId)) || null;
@@ -914,7 +928,8 @@ export const repo = {
     )`).catch(() => {});
     for (const col of ["customer_id BIGINT", "customer_name TEXT DEFAULT ''", "customer_email TEXT DEFAULT ''",
       "event_end_date TEXT", "guests INT", "location TEXT DEFAULT ''", "notes TEXT DEFAULT ''",
-      "source VARCHAR(16) DEFAULT 'customer'", "status VARCHAR(20) DEFAULT 'pending'"]) {
+      "source VARCHAR(16) DEFAULT 'customer'", "status VARCHAR(20) DEFAULT 'pending'",
+      "completion_status VARCHAR(16)"]) {
       await query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
     }
     // Old tables carried NOT NULLs and CHECKs incompatible with the new flow
@@ -1005,11 +1020,31 @@ export const repo = {
     const ids = (Array.isArray(vendorId) ? vendorId : [vendorId]).filter((x) => x != null);
     if (usingPg) {
       const r = await query(`SELECT * FROM bookings WHERE vendor_id=ANY($1) ORDER BY event_date ASC NULLS LAST, created_at DESC`, [ids]);
-      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, customerName: b.customer_name, customerEmail: b.status === "confirmed" ? (b.customer_email || "") : "", date: b.event_date, endDate: b.event_end_date, guests: b.guests, location: b.location, notes: b.notes || "", source: b.source || "customer", status: b.status }));
+      return r.rows.map((b) => ({ id: "bk" + b.id, vendorId: b.vendor_id, customerName: b.customer_name, customerEmail: b.status === "confirmed" ? (b.customer_email || "") : "", date: b.event_date, endDate: b.event_end_date, guests: b.guests, location: b.location, notes: b.notes || "", source: b.source || "customer", status: b.status, completionStatus: b.completion_status || null }));
     }
     const db = getDb();
     return (db.bookings || []).filter((b) => ids.some((vid) => String(vid) === String(b.vendorId)))
-      .map((b) => ({ id: "bk" + b.id, vendorId: b.vendorId, customerName: b.customerName, customerEmail: b.status === "confirmed" ? (b.customerEmail || "") : "", date: b.eventDate, endDate: b.eventEndDate, guests: b.guests, location: b.location, notes: b.notes || "", source: b.source || "customer", status: b.status }));
+      .map((b) => ({ id: "bk" + b.id, vendorId: b.vendorId, customerName: b.customerName, customerEmail: b.status === "confirmed" ? (b.customerEmail || "") : "", date: b.eventDate, endDate: b.eventEndDate, guests: b.guests, location: b.location, notes: b.notes || "", source: b.source || "customer", status: b.status, completionStatus: b.completionStatus || null }));
+  },
+
+  // The vendor's own self-report on whether a confirmed booking actually
+  // happened, once its event date has passed. This is the ONLY source of
+  // truth for "did this turn into real business" — the platform doesn't
+  // process payments, so there's no automatic way to verify completion.
+  async markBookingCompletion(bookingId, vendorIds, completed) {
+    const rawId = String(bookingId).replace(/^bk/, "");
+    const ids = (Array.isArray(vendorIds) ? vendorIds : [vendorIds]).filter((x) => x != null);
+    const status = completed ? "completed" : "fell_through";
+    if (usingPg) {
+      const r = await query(
+        `UPDATE bookings SET completion_status=$1 WHERE id=$2 AND vendor_id=ANY($3) AND status='confirmed' RETURNING *`,
+        [status, rawId, ids]);
+      return r.rows[0] || null;
+    }
+    const db = getDb();
+    const b = (db.bookings || []).find((x) => String(x.id) === String(rawId) && ids.some((vid) => String(vid) === String(x.vendorId)) && x.status === "confirmed");
+    if (!b) return null;
+    b.completionStatus = status; memSave(); return b;
   },
 
   async listBookingsForCustomer(customerId) {
